@@ -203,6 +203,9 @@ const grid = new Uint8Array(G*G);
 D.grid.forEach((row,i)=>{ for(let j=0;j<G;j++) grid[i*G+j] = row.charCodeAt(j)-48; });
 const RR = Math.max(1, Math.round(0.22/MPP));   // 机器人半径 ~0.22m 障碍膨胀
 const blocked = new Uint8Array(G*G);
+// 未知区(没观测过)=没路, 直接不可通行 —— 只在已观测 free + 轨迹走廊上导航,
+// 否则细长地图上 A* 会宁付代价也斜穿未观测区抄近路(实测 C8 出现)
+for(let i=0;i<G*G;i++) if(grid[i]===0) blocked[i]=1;
 for(let i=0;i<G;i++)for(let j=0;j<G;j++) if(grid[i*G+j]===2){
   for(let di=-RR;di<=RR;di++)for(let dj=-RR;dj<=RR;dj++){
     const ni=i+di,nj=j+dj;
@@ -257,7 +260,7 @@ function astar(s,g){
     while(true){ let l=2*c+1,r=2*c+2,m=c;
       if(l<n&&hf[l]<hf[m])m=l; if(r<n&&hf[r]<hf[m])m=r; if(m===c)break;
       [hf[m],hf[c]]=[hf[c],hf[m]];[hid[m],hid[c]]=[hid[c],hid[m]];c=m; } return id0; };
-  gsc[si]=0; push(hh(si),si); const UNK=2;
+  gsc[si]=0; push(hh(si),si);
   const nb=[[-1,0,1],[1,0,1],[0,-1,1],[0,1,1],[-1,-1,1.41421],[-1,1,1.41421],[1,-1,1.41421],[1,1,1.41421]];
   while(hf.length){ const cur=pop(); if(closed[cur])continue; closed[cur]=1;
     if(cur===gi){ const p=[]; let c=cur;
@@ -266,10 +269,41 @@ function astar(s,g){
     for(const[di,dj,w]of nb){ const ni=ci+di,nj=cj+dj;
       if(ni<0||ni>=G||nj<0||nj>=G) continue; const id=ni*G+nj;
       if(blocked[id]||closed[id]) continue;
-      const pen=(trajCell[id]||grid[id]===1)?1.0:UNK;
-      const ng=gsc[cur]+w*pen;
+      const ng=gsc[cur]+w;   // 未知区已 blocked, 可走格代价一致
       if(ng<gsc[id]){ gsc[id]=ng; came[id]=cur; push(ng+hh(id),id); } } }
   return null; }
+
+// Dijkstra 全图距离场 (px): 语言匹配时给每个语义节点算"距起点的真实可走距离",
+// 让 LLM 在多个同类节点中选最近的; Infinity=从起点不可达。按起点缓存。
+let _dfKey=-1, _dfDist=null;
+function distanceField(s){ const key=s.i*G+s.j;
+  if(_dfKey===key) return _dfDist;
+  const dist=new Float32Array(G*G).fill(Infinity);
+  const closed=new Uint8Array(G*G);
+  const hf=[],hid=[];
+  const push=(f,id)=>{ hf.push(f);hid.push(id); let c=hf.length-1;
+    while(c>0){ const p=(c-1)>>1; if(hf[p]<=hf[c])break;
+      [hf[p],hf[c]]=[hf[c],hf[p]];[hid[p],hid[c]]=[hid[c],hid[p]];c=p; } };
+  const pop=()=>{ const id0=hid[0],last=hf.length-1; hf[0]=hf[last];hid[0]=hid[last];hf.pop();hid.pop();
+    let c=0,n=hf.length;
+    while(true){ let l=2*c+1,r=2*c+2,m=c;
+      if(l<n&&hf[l]<hf[m])m=l; if(r<n&&hf[r]<hf[m])m=r; if(m===c)break;
+      [hf[m],hf[c]]=[hf[c],hf[m]];[hid[m],hid[c]]=[hid[c],hid[m]];c=m; } return id0; };
+  const nb=[[-1,0,1],[1,0,1],[0,-1,1],[0,1,1],[-1,-1,1.41421],[-1,1,1.41421],[1,-1,1.41421],[1,1,1.41421]];
+  dist[s.i*G+s.j]=0; push(0,s.i*G+s.j);
+  while(hf.length){ const cur=pop(); if(closed[cur])continue; closed[cur]=1;
+    const ci=(cur/G)|0, cj=cur%G;
+    for(const[di,dj,w]of nb){ const ni=ci+di,nj=cj+dj;
+      if(ni<0||ni>=G||nj<0||nj>=G) continue; const id=ni*G+nj;
+      if(blocked[id]||closed[id]) continue;
+      const nd=dist[cur]+w;
+      if(nd<dist[id]){ dist[id]=nd; push(nd,id); } } }
+  _dfKey=key; _dfDist=dist; return dist; }
+function nodeDistFrom(df,n){ // 节点邻域内最小距离 (节点圆点可能压在膨胀障碍上)
+  const j0=Math.round(n.px[0]), i0=Math.round(n.px[1]); let d=Infinity;
+  for(let di=-5;di<=5;di++)for(let dj=-5;dj<=5;dj++){ const ni=i0+di,nj=j0+dj;
+    if(ni>=0&&ni<G&&nj>=0&&nj<G) d=Math.min(d,df[ni*G+nj]); }
+  return d; }
 
 // ---- 视图/画布 ----
 const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
@@ -536,8 +570,17 @@ async function nlQuery(kind){ const t=document.getElementById('nlText').value.tr
   const msg=document.getElementById('nlMsg');
   if(!t){ msg.textContent='请输入地点描述'; msg.className='nlmsg err'; return; }
   msg.textContent='匹配中…'; msg.className='nlmsg';
+  // 找终点且已设起点时, 附带每个节点距起点的真实可走距离(Dijkstra 距离场),
+  // 让语言匹配在多个同类节点中优先选最近可达的
+  const body={text:t};
+  const ref = kind==='G'? start : goal;
+  if(ref){ const df=distanceField(ref);
+    body.ref_label=ref.label;
+    body.ref_kind = kind==='G'? '起点' : '终点';
+    body.node_dists=D.nodes.map(n=>{ const d=nodeDistFrom(df,n);
+      return isFinite(d)? +(d*MPP).toFixed(1) : null; }); }
   try{ const r=await fetch('/api/nl_query',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})});
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const j=await r.json();
     if(!j.ok){ msg.textContent='✗ '+j.reason; msg.className='nlmsg err'; return; }
     const n=D.nodes[j.node_id];

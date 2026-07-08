@@ -49,22 +49,38 @@ def thumbs(p):
 def nl_query():
     """自然语言 -> 最匹配的语义节点。body: {text: str}
     返回 {ok, node_id, name, reason} 或 {ok: false, reason}"""
-    text = (request.json or {}).get("text", "").strip()
+    j = request.json or {}
+    text = j.get("text", "").strip()
     if not text:
         return jsonify({"ok": False, "reason": "空查询"})
     nodes = _load_nodes()
     if not nodes:
         return jsonify({"ok": False, "reason": "地图还没有语义节点"})
 
+    # 前端可附带各节点距参考点(通常=已设起点)的真实可走距离, 用于同类多节点时就近选择
+    dists = j.get("node_dists")
+    ref_label = j.get("ref_label", "")
+    ref_kind = j.get("ref_kind", "起点")
+
+    def _dist_str(i):
+        if not dists or i >= len(dists):
+            return ""
+        return f", 距{ref_kind} {dists[i]} 单位" if dists[i] is not None else f", 从{ref_kind}不可达"
+
     listing = "\n".join(
-        f"- id={i}: {n['name']} (类别: {n['category']}, 描述: {n['description']})"
+        f"- id={i}: {n['name']} (类别: {n['category']}, 描述: {n['description']}{_dist_str(i)})"
         for i, n in enumerate(nodes))
+    dist_rule = ""
+    if dists:
+        dist_rule = (f"\n- 用户已设{ref_kind}「{ref_label}」。若多个节点同样符合描述, "
+                     f"必须选距{ref_kind}最近的那个; 标注\"不可达\"的节点不要选。")
     prompt = f"""你是室内导航助手。地图上有以下语义地标节点:
 {listing}
 
 用户想去的地点描述: "{text}"
 
-选出最匹配的一个节点。如果没有任何节点合理匹配(比如用户描述的地点类型在列表中不存在), matched=false。
+规则:
+- 选出最匹配的一个节点。如果没有任何节点合理匹配(比如用户描述的地点类型在列表中不存在), matched=false。{dist_rule}
 只输出 JSON: {{"matched": true/false, "node_id": 数字, "reason": "一句话理由"}}"""
 
     schema = {"type": "object",
