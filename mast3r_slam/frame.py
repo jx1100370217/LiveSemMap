@@ -135,6 +135,7 @@ class SharedStates:
         self.global_optimizer_tasks = manager.list()
         self.edges_ii = manager.list()
         self.edges_jj = manager.list()
+        self.reset_count = manager.Value("i", 0)  # 重新建图: 每次+1, 后端据此重建因子图/检索库
 
         self.feat_dim = 1024
         self.num_patches = h * w // (16 * 16)
@@ -203,6 +204,23 @@ class SharedStates:
     def set_mode(self, mode):
         with self.lock:
             self.mode.value = mode
+
+    def get_reset(self):
+        with self.lock:
+            return self.reset_count.value
+
+    def clear_for_reset(self):
+        """重新建图: 回到 INIT, 清空优化任务/回环边/重定位信号量, reset 计数+1(通知后端重建)。"""
+        with self.lock:
+            self.mode.value = Mode.INIT
+            self.reloc_sem.value = 0
+            while len(self.global_optimizer_tasks):
+                self.global_optimizer_tasks.pop()
+            while len(self.edges_ii):
+                self.edges_ii.pop()
+            while len(self.edges_jj):
+                self.edges_jj.pop()
+            self.reset_count.value += 1
 
     def pause(self):
         with self.lock:

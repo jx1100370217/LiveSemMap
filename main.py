@@ -25,6 +25,19 @@ from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 
 
+def solve_gn_safe(factor_graph, tag=""):
+    """全局优化, OOM 时跳过而非让后端进程崩溃(崩了=后续无回环/全局优化)。
+    注意: 不能用 torch.cuda.empty_cache() —— 后端与主进程共享 CUDA IPC 关键帧张量,
+    在此进程 empty_cache 会干扰共享张量、破坏 tracking(实测会让跟踪很快丢失)。"""
+    try:
+        if config["use_calib"]:
+            factor_graph.solve_GN_calib()
+        else:
+            factor_graph.solve_GN_rays()
+    except torch.cuda.OutOfMemoryError:
+        print(f"[backend] 显存不足, 跳过{tag}本次全局优化(后端存活; 最终漂移由 VIO 位姿重建 _vio.ply 修正)")
+
+
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     # we are adding and then removing from the keyframe, so we need to be careful.
     # The lock slows viz down but safer this way...
@@ -44,12 +57,17 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
             kf_idx = list(kf_idx)  # convert to list
             frame_idx = [n_kf - 1] * len(kf_idx)
             print("RELOCALIZING against kf ", n_kf - 1, " and ", kf_idx)
-            if factor_graph.add_factors(
-                frame_idx,
-                kf_idx,
-                config["reloc"]["min_match_frac"],
-                is_reloc=config["reloc"]["strict"],
-            ):
+            try:
+                added = factor_graph.add_factors(
+                    frame_idx,
+                    kf_idx,
+                    config["reloc"]["min_match_frac"],
+                    is_reloc=config["reloc"]["strict"],
+                )
+            except torch.cuda.OutOfMemoryError:  # 显存不足时不崩后端, 当作重定位失败
+                print("[backend] 显存不足, 跳过本次重定位")
+                added = False
+            if added:
                 retrieval_database.update(
                     frame,
                     add_after_query=True,
@@ -64,10 +82,7 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
                 print("Failed to relocalize")
 
         if successful_loop_closure:
-            if config["use_calib"]:
-                factor_graph.solve_GN_calib()
-            else:
-                factor_graph.solve_GN_rays()
+            solve_gn_safe(factor_graph, "reloc ")
         return successful_loop_closure
 
 
@@ -78,9 +93,15 @@ def run_backend(cfg, model, states, keyframes, K):
     factor_graph = FactorGraph(model, keyframes, K, device)
     retrieval_database = load_retriever(model)
 
+    last_reset = states.get_reset()
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
         mode = states.get_mode()
+        r = states.get_reset()
+        if r != last_reset:  # 重新建图: 重建因子图 + 清空检索库(丢弃旧关键帧)
+            factor_graph = FactorGraph(model, keyframes, K, device)
+            retrieval_database.reset()
+            last_reset = r
         if mode == Mode.INIT or states.is_paused():
             time.sleep(0.01)
             continue
@@ -119,23 +140,31 @@ def run_backend(cfg, model, states, keyframes, K):
         if len(lc_inds) > 0:
             print("Database retrieval", idx, ": ", lc_inds)
 
+        # 方案B: viewer 用 VIO 位姿显示无漂移地图, 后端全局优化(加边+GN求解)对显示地图无意义,
+        # 跳过它省下后端约7GB显存 —— 否则 VIO+viewer 主/后端双模型推理会撑满显存导致卡顿。
+        # 上面的 retrieval_database.update 保留(供重定位); 关键帧位姿由 tracker 维护(相对配准足够)。
+        if config.get("vio_path"):
+            with states.lock:
+                if len(states.global_optimizer_tasks) > 0:
+                    states.global_optimizer_tasks.pop(0)
+            continue
+
         kf_idx = set(kf_idx)  # Remove duplicates by using set
         kf_idx.discard(idx)  # Remove current kf idx if included
         kf_idx = list(kf_idx)  # convert to list
         frame_idx = [idx] * len(kf_idx)
-        if kf_idx:
-            factor_graph.add_factors(
-                kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
-            )
-
-        with states.lock:
-            states.edges_ii[:] = factor_graph.ii.cpu().tolist()
-            states.edges_jj[:] = factor_graph.jj.cpu().tolist()
-
-        if config["use_calib"]:
-            factor_graph.solve_GN_calib()
-        else:
-            factor_graph.solve_GN_rays()
+        # 加边+全局优化整块 OOM 保护: 任一处爆显存都 empty_cache 跳过, 而非让后端进程崩溃
+        try:
+            if kf_idx:
+                factor_graph.add_factors(
+                    kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
+                )
+            with states.lock:
+                states.edges_ii[:] = factor_graph.ii.cpu().tolist()
+                states.edges_jj[:] = factor_graph.jj.cpu().tolist()
+            solve_gn_safe(factor_graph, f"kf{idx} ")
+        except torch.cuda.OutOfMemoryError:
+            print(f"[backend] 显存不足, 跳过 kf{idx} 图构建/优化(后端存活)")
 
         with states.lock:
             if len(states.global_optimizer_tasks) > 0:
@@ -151,11 +180,17 @@ if __name__ == "__main__":
     datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
-    parser.add_argument("--config", default="config/base.yaml")
+    parser.add_argument("--dataset", default="datasets/insight9")
+    parser.add_argument("--config", default="config/insight9.yaml")
     parser.add_argument("--save-as", default="default")
-    parser.add_argument("--no-viz", action="store_true")
-    parser.add_argument("--calib", default="")
+    parser.add_argument("--no-viz", default=False)
+    parser.add_argument("--calib", default="config/intrinsics_insight9.yaml")
+    # parser.add_argument("--vio", default=None,
+    parser.add_argument("--vio", default="datasets/insight9/vio.txt",
+                        help="方案B: VIO 度量轨迹(vio.txt, 同目录需 timestamps.txt), 给跟踪做运动补偿位姿先验; "
+                             "不给=纯RGB(行为不变)")
+    parser.add_argument("--snapshot-every", type=int, default=0,
+                        help="每 N 个关键帧存一次增量点云快照到 logs/<save_as>/snapshots/ (0=关)")
 
     args = parser.parse_args()
 
@@ -183,7 +218,16 @@ if __name__ == "__main__":
             intrinsics["calibration"],
         )
 
-    keyframes = SharedKeyframes(manager, h, w)
+    # 方案B: VIO 位姿先验 (仅 --vio 时启用; 纯RGB路径下 vio_prior 恒为 None, 行为不变)
+    vio_prior = None
+    if args.vio:
+        from mast3r_slam.vio_prior import VIOPrior
+        vio_prior = VIOPrior(args.vio, config["dataset"]["subsample"], device)
+        config["vio_path"] = args.vio  # 传给 viewer 进程, 让 viewer 用 VIO 位姿渲染(无漂移)
+        print(f"[方案B] 已启用 VIO 运动补偿位姿先验: {args.vio}")
+
+    # VIO 强制建关键帧会更密, 需更大缓冲; 纯RGB 保持默认 512 不变
+    keyframes = SharedKeyframes(manager, h, w, buffer=(800 if args.vio else 512))
     states = SharedStates(manager, h, w)
 
     if not args.no_viz:
@@ -230,9 +274,29 @@ if __name__ == "__main__":
 
     frames = []
 
+    # 增量快照: 每 args.snapshot_every 个关键帧存一次当前点云 (体现增量建图过程)
+    snap_dir = None
+    next_snap = args.snapshot_every
+    if args.snapshot_every and dataset.save_results:
+        _sd, _sn = eval.prepare_savedir(args, dataset)
+        snap_dir = _sd / "snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+
     while True:
         mode = states.get_mode()
         msg = try_get_msg(viz2main)
+        if msg is not None and getattr(msg, "reset", False):
+            # 重新建图: 清空关键帧/状态/跟踪器, 从第 0 帧重来
+            # (后端据 states.reset_count 变化重建因子图+检索库; viewer 清纹理/地图缓存)
+            states.clear_for_reset()
+            with keyframes.lock:
+                keyframes.n_size.value = 0
+            tracker = FrameTracker(model, keyframes, device)
+            i = 0
+            fps_timer = time.time()
+            next_snap = args.snapshot_every  # 快照序号也重新开始
+            print("[重新建图] 已清空, 从第 0 帧重来")
+            continue
         last_msg = msg if msg is not None else last_msg
         if last_msg.is_terminated:
             states.set_mode(Mode.TERMINATED)
@@ -260,6 +324,8 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
+        if vio_prior is not None and i > 0:  # 方案B: VIO 运动补偿位姿初始化(纯RGB时 vio_prior=None, 跳过)
+            T_WC = vio_prior.predict(i, T_WC)
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
 
         if mode == Mode.INIT:
@@ -267,6 +333,8 @@ if __name__ == "__main__":
             X_init, C_init = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
+            if vio_prior is not None:
+                vio_prior.note_keyframe(i)
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
@@ -275,6 +343,10 @@ if __name__ == "__main__":
 
         if mode == Mode.TRACKING:
             add_new_kf, match_info, try_reloc = tracker.track(frame)
+            if vio_prior is not None:  # 方案B
+                vio_prior.update(i, frame.T_WC)  # 更新 MASt3R<->VIO 尺度
+                if not try_reloc and vio_prior.moved_enough(i):
+                    add_new_kf = True  # VIO 运动够大 -> 趁重叠还够强制建关键帧, 防快速运动跟丢
             if try_reloc:
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
@@ -296,6 +368,8 @@ if __name__ == "__main__":
 
         if add_new_kf:
             keyframes.append(frame)
+            if vio_prior is not None:
+                vio_prior.note_keyframe(i)
             states.queue_global_optimization(len(keyframes) - 1)
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
@@ -307,17 +381,36 @@ if __name__ == "__main__":
         if i % 30 == 0:
             FPS = i / (time.time() - fps_timer)
             print(f"FPS: {FPS}")
+        # 增量快照: 当前关键帧数达到阈值就存一次点云
+        if snap_dir is not None and len(keyframes) >= next_snap:
+            with keyframes.lock:
+                nkf = len(keyframes)
+                eval.save_reconstruction(
+                    snap_dir, f"snap_{nkf:04d}.ply",
+                    keyframes, last_msg.C_conf_threshold,
+                )
+                import numpy as _np
+                _ctr = _np.array([keyframes[k].T_WC.data.cpu().numpy().reshape(-1)[:3]
+                                  for k in range(nkf)])
+                _np.save(snap_dir / f"centers_{nkf:04d}.npy", _ctr)
+            print(f"[snapshot] kf={nkf} -> {snap_dir}")
+            next_snap += args.snapshot_every
         i += 1
 
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
         eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
+        eval.save_keyframe_poses(save_dir, f"{seq_name}_kf_poses.txt", dataset.timestamps, keyframes)
         eval.save_reconstruction(
             save_dir,
             f"{seq_name}.ply",
             keyframes,
             last_msg.C_conf_threshold,
         )
+        if vio_prior is not None:  # 方案B: 额外存一份 VIO 位姿重建(治漂移)
+            eval.save_reconstruction_vio(
+                save_dir, f"{seq_name}_vio.ply", keyframes, vio_prior, last_msg.C_conf_threshold
+            )
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
         )

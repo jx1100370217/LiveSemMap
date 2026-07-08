@@ -137,4 +137,7 @@ logs/
 screen.yaml
 *.pt
 *.ini
+
+# 本机搭建产物 (5090/gcc-14 编译器 shim)
+.gcc14/
 notebooks/*

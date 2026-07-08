@@ -21,6 +21,12 @@ class RetrievalDatabase(Retriever):
             device=self.query_device, dtype=self.query_dtype
         )
 
+    def reset(self):
+        """重新建图: 清空已建库的关键帧描述子 (不重载模型/码本)。"""
+        self.ivf_builder = self.asmk.create_ivf_builder()
+        self.kf_counter = 0
+        self.kf_ids = []
+
     # Mirrors forward_local in extract_local_features from retrieval/model.py
     def prep_features(self, backbone_feat):
         retrieval_model = self.model

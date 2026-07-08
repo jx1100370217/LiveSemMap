@@ -1,0 +1,8 @@
+inherit: "config/calib.yaml"
+# insight9 (RealSense wrist_right, 已rectified针孔) 默认建图配置。内参 config/intrinsics_insight9.yaml。
+# 数据已在前处理里按 VIO 运动过滤过静止/冗余帧, 这里用全部帧(subsample:1);
+# 这份快速行走数据帧间运动大, subsample>1 会跟丢, 故不降采样。
+#   纯RGB:   python main.py
+#   VIO增强: python main.py --vio datasets/insight9/vio.txt
+dataset:
+  subsample: 1

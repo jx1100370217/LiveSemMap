@@ -1,0 +1,6 @@
+inherit: "config/calib.yaml"
+# Mapping_C8 (深港国际C8) 默认配置: 标定模式 (VGP-Nav 去畸变 camera_1 针孔序列),
+# 内参见 config/intrinsics_c8.yaml。继承 calib.yaml (use_calib) 但用全部帧。
+# 单线程无头评测请改用 --config config/eval_calib.yaml。
+dataset:
+  subsample: 1   # 用上 Mapping_C8 全部 626 帧 (calib.yaml 默认是每 2 帧取 1)
