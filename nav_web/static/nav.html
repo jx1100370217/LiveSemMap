@@ -216,11 +216,16 @@ function _mark(ci,cj){ for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++){
   const ni=ci+di,nj=cj+dj;
   if(ni>=0&&ni<G&&nj>=0&&nj<G){ const id=ni*G+nj; blocked[id]=0; trajCell[id]=1; } } }
 const JUMP=Math.max(10, Math.round(3.0/MPP));  // 相邻 kf 间距超 ~3m 视为回环/重定位跳变, 不连线
+// 传送门: 跳变两端是同一物理位置在漂移地图中的两个坐标 —— 不画线不计里程,
+// 但图搜索(A*/距离场/连通域)中两端连通, 否则跳变会把地图切成互不可达的两半
+const portalMap=new Map();
 let _pc=null;
 for(const k of D.kf){ const cj=Math.round(k.px[0]), ci=Math.round(k.px[1]);
   if(_pc){ const m=Math.max(Math.abs(ci-_pc[0]),Math.abs(cj-_pc[1]))||1;
     if(m<=JUMP) for(let s=1;s<=m;s++)_mark(Math.round(_pc[0]+(ci-_pc[0])*s/m),Math.round(_pc[1]+(cj-_pc[1])*s/m));
-    else _mark(ci,cj); }
+    else{ _mark(ci,cj);
+      const a=_pc[0]*G+_pc[1], b=ci*G+cj;
+      portalMap.set(a,b); portalMap.set(b,a); } }
   else _mark(ci,cj);
   _pc=[ci,cj]; }
 // 最大连通可通行区: 起终点只吸附到此区 -> A* 必有路径
@@ -231,18 +236,26 @@ const mainRegion = new Uint8Array(G*G);
     while(st.length){ const c=st.pop(); sz++; const ci=(c/G)|0, cj=c%G;
       for(const[di,dj]of[[-1,0],[1,0],[0,-1],[0,1]]){ const ni=ci+di,nj=cj+dj;
         if(ni<0||ni>=G||nj<0||nj>=G) continue; const id=ni*G+nj;
-        if(blocked[id]||comp[id]>=0) continue; comp[id]=cid; st.push(id); } }
+        if(blocked[id]||comp[id]>=0) continue; comp[id]=cid; st.push(id); }
+      const pt=portalMap.get(c);   // 传送门对端并入同一连通域
+      if(pt!==undefined&&!blocked[pt]&&comp[pt]<0){ comp[pt]=cid; st.push(pt); } }
     if(sz>bestSz){bestSz=sz;best=cid;} cid++; }
   for(let i=0;i<G*G;i++) if(comp[i]===best) mainRegion[i]=1; })();
 
 function inMain(i,j){ return i>=0&&i<G&&j>=0&&j<G&&mainRegion[i*G+j]===1; }
 function inMainFree(i,j){ return inMain(i,j)&&grid[i*G+j]===1; }
 function snap(px,py){ const j0=Math.round(px), i0=Math.round(py);
+  // 距离优先: 逐半径向外环搜, 同半径内 free 优先、主区走廊格(trajCell)兜底。
+  // 不能先全范围搜 free 再搜走廊 —— 占据质量差的区域 free 稀少, 会把点击点
+  // 吸到十几米外的 free 格, 而近在 1 格的轨迹走廊格被跳过(实测 C8 大厅区)。
   if(inMainFree(i0,j0)) return {x:px,y:py,i:i0,j:j0};
-  for(const test of [inMainFree,inMain])
-    for(let r=1;r<160;r++)for(let di=-r;di<=r;di++)for(let dj=-r;dj<=r;dj++){
+  if(inMain(i0,j0)) return {x:px,y:py,i:i0,j:j0};
+  for(let r=1;r<160;r++){ let fb=null;
+    for(let di=-r;di<=r;di++)for(let dj=-r;dj<=r;dj++){
       if(Math.abs(di)!==r&&Math.abs(dj)!==r) continue;
-      if(test(i0+di,j0+dj)) return {x:j0+dj,y:i0+di,i:i0+di,j:j0+dj}; }
+      if(inMainFree(i0+di,j0+dj)) return {x:j0+dj,y:i0+di,i:i0+di,j:j0+dj};
+      if(fb===null&&inMain(i0+di,j0+dj)) fb=[i0+di,j0+dj]; }
+    if(fb) return {x:fb[1],y:fb[0],i:fb[0],j:fb[1]}; }
   return {x:px,y:py,i:i0,j:j0}; }
 
 // ---- A* (8连通 二叉堆; 轨迹/free 代价1, 未知2, 沿走廊优先) ----
@@ -270,7 +283,10 @@ function astar(s,g){
       if(ni<0||ni>=G||nj<0||nj>=G) continue; const id=ni*G+nj;
       if(blocked[id]||closed[id]) continue;
       const ng=gsc[cur]+w;   // 未知区已 blocked, 可走格代价一致
-      if(ng<gsc[id]){ gsc[id]=ng; came[id]=cur; push(ng+hh(id),id); } } }
+      if(ng<gsc[id]){ gsc[id]=ng; came[id]=cur; push(ng+hh(id),id); } }
+    const pt=portalMap.get(cur);   // 传送门: 同一物理位置, 近零代价穿越
+    if(pt!==undefined&&!blocked[pt]&&!closed[pt]){ const ng=gsc[cur]+0.01;
+      if(ng<gsc[pt]){ gsc[pt]=ng; came[pt]=cur; push(ng+hh(pt),pt); } } }
   return null; }
 
 // Dijkstra 全图距离场 (px): 语言匹配时给每个语义节点算"距起点的真实可走距离",
@@ -297,13 +313,20 @@ function distanceField(s){ const key=s.i*G+s.j;
       if(ni<0||ni>=G||nj<0||nj>=G) continue; const id=ni*G+nj;
       if(blocked[id]||closed[id]) continue;
       const nd=dist[cur]+w;
-      if(nd<dist[id]){ dist[id]=nd; push(nd,id); } } }
+      if(nd<dist[id]){ dist[id]=nd; push(nd,id); } }
+    const pt=portalMap.get(cur);
+    if(pt!==undefined&&!blocked[pt]&&!closed[pt]){ const nd=dist[cur]+0.01;
+      if(nd<dist[pt]){ dist[pt]=nd; push(nd,pt); } } }
   _dfKey=key; _dfDist=dist; return dist; }
-function nodeDistFrom(df,n){ // 节点邻域内最小距离 (节点圆点可能压在膨胀障碍上)
-  const j0=Math.round(n.px[0]), i0=Math.round(n.px[1]); let d=Infinity;
-  for(let di=-5;di<=5;di++)for(let dj=-5;dj<=5;dj++){ const ni=i0+di,nj=j0+dj;
+function nodeDistFrom(df,n){ // 用代表关键帧位置(在轨迹上必可达)的邻域最小距离
+  const kp=D.kf[n.rep_kf].px;
+  const j0=Math.round(kp[0]), i0=Math.round(kp[1]); let d=Infinity;
+  for(let di=-3;di<=3;di++)for(let dj=-3;dj<=3;dj++){ const ni=i0+di,nj=j0+dj;
     if(ni>=0&&ni<G&&nj>=0&&nj<G) d=Math.min(d,df[ni*G+nj]); }
   return d; }
+// 语义节点作为起终点: 用代表关键帧位置(圆点是多帧均值, 漂移下可能落在墙内/未知区)
+function nodeEndpoint(kind,n){ const kp=D.kf[n.rep_kf].px;
+  setEndpoint(kind, kp[0], kp[1], n.name, n.rep_kf); }
 
 // ---- 视图/画布 ----
 const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
@@ -373,7 +396,8 @@ function plan(){ path=null; pathLen=0; robot=null; stopAnim();
   document.getElementById('tPlan').textContent=dt.toFixed(0)+' ms';
   if(!p){ toast('⚠ 两点间无可行路径'); document.getElementById('bPath').textContent='无路径'; return; }
   path=p; pathLen=0;
-  for(let i=1;i<p.length;i++) pathLen+=Math.hypot(p[i][0]-p[i-1][0],p[i][1]-p[i-1][1]);
+  for(let i=1;i<p.length;i++){ const sg=Math.hypot(p[i][0]-p[i-1][0],p[i][1]-p[i-1][1]);
+    if(sg<=JUMP) pathLen+=sg; }   // 传送门段=同一物理位置, 不计里程
   document.getElementById('bPath').textContent=fmtM(pathLen);
   document.getElementById('tLen').textContent=fmtM(pathLen);
   document.getElementById('tEta').textContent=isMetric? (pathLen*MPP/speed).toFixed(0)+' s':'-';
@@ -398,8 +422,9 @@ function startNav(){ if(!path) return; stopAnim();
   anim=requestAnimationFrame(step); }
 function samplePath(t){ let acc=0;
   for(let i=1;i<path.length;i++){
-    const seg=Math.hypot(path[i][0]-path[i-1][0],path[i][1]-path[i-1][1]);
-    if(acc+seg>=t){ const r=(t-acc)/seg;
+    const raw=Math.hypot(path[i][0]-path[i-1][0],path[i][1]-path[i-1][1]);
+    const seg=raw>JUMP?0:raw;   // 传送门段瞬移
+    if(seg>0&&acc+seg>=t){ const r=(t-acc)/seg;
       return [[path[i-1][0]+(path[i][0]-path[i-1][0])*r, path[i-1][1]+(path[i][1]-path[i-1][1])*r],
               Math.atan2(path[i][1]-path[i-1][1],path[i][0]-path[i-1][0]), false]; }
     acc+=seg; }
@@ -463,7 +488,9 @@ function render(){ if(staticDirty) renderStatic();
   // 路线 (发光绿)
   if(path){ ctx.save(); ctx.strokeStyle='#5cff9d'; ctx.lineWidth=3;
     ctx.shadowColor='#5cff9d'; ctx.shadowBlur=12; ctx.beginPath();
-    path.forEach((p,i)=>{ const[sx,sy]=p2s(p[0],p[1]); i?ctx.lineTo(sx,sy):ctx.moveTo(sx,sy); });
+    path.forEach((p,i)=>{ const[sx,sy]=p2s(p[0],p[1]);
+      const tp=i&&Math.max(Math.abs(p[0]-path[i-1][0]),Math.abs(p[1]-path[i-1][1]))>JUMP;
+      (!i||tp)?ctx.moveTo(sx,sy):ctx.lineTo(sx,sy); });   // 传送门段断开
     ctx.stroke(); ctx.restore(); }
   // 起终点
   if(start) drawFlag(start,'#2de2e6','S');
@@ -518,7 +545,7 @@ cv.addEventListener('click',e=>{ if(moved) return;
   if(mode==='idle'&&ni<0) return;
   const kind = mode==='pickG'?'G':'S';
   if(ni>=0){ const n=D.nodes[ni]; selectNode(ni,false);
-    if(mode!=='idle'){ setEndpoint(kind,n.px[0],n.px[1],n.name,n.rep_kf); setMode('idle'); }
+    if(mode!=='idle'){ nodeEndpoint(kind,n); setMode('idle'); }
     return; }
   setEndpoint(kind,px,py,null,null); setMode('idle'); });
 
@@ -553,7 +580,7 @@ D.nodes.forEach((n,i)=>{ const div=document.createElement('div');
     <span class="cat">${n.cat_zh} ${n.conf}</span>
     <div class="act"><button data-k="S">S</button><button data-k="G">G</button></div>`;
   div.onclick=e=>{ if(e.target.dataset.k){
-      setEndpoint(e.target.dataset.k,n.px[0],n.px[1],n.name,n.rep_kf); return; }
+      nodeEndpoint(e.target.dataset.k,n); return; }
     selectNode(i,true); };
   listEl.appendChild(div); });
 function selectNode(i,center){ selNode=i; staticDirty=true;
@@ -586,7 +613,7 @@ async function nlQuery(kind){ const t=document.getElementById('nlText').value.tr
     const n=D.nodes[j.node_id];
     msg.textContent=`✓ 匹配到「${n.name}」— ${j.reason}`; msg.className='nlmsg ok';
     selectNode(j.node_id,true);
-    setEndpoint(kind,n.px[0],n.px[1],n.name,n.rep_kf);
+    nodeEndpoint(kind,n);
   }catch(e){ msg.textContent='✗ 服务不可用: '+e; msg.className='nlmsg err'; } }
 document.getElementById('btnNlS').onclick=()=>nlQuery('S');
 document.getElementById('btnNlG').onclick=()=>nlQuery('G');
