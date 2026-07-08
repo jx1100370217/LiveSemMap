@@ -212,10 +212,12 @@ const trajCell = new Uint8Array(G*G);
 function _mark(ci,cj){ for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++){
   const ni=ci+di,nj=cj+dj;
   if(ni>=0&&ni<G&&nj>=0&&nj<G){ const id=ni*G+nj; blocked[id]=0; trajCell[id]=1; } } }
+const JUMP=Math.max(10, Math.round(3.0/MPP));  // 相邻 kf 间距超 ~3m 视为回环/重定位跳变, 不连线
 let _pc=null;
 for(const k of D.kf){ const cj=Math.round(k.px[0]), ci=Math.round(k.px[1]);
   if(_pc){ const m=Math.max(Math.abs(ci-_pc[0]),Math.abs(cj-_pc[1]))||1;
-    for(let s=1;s<=m;s++)_mark(Math.round(_pc[0]+(ci-_pc[0])*s/m),Math.round(_pc[1]+(cj-_pc[1])*s/m)); }
+    if(m<=JUMP) for(let s=1;s<=m;s++)_mark(Math.round(_pc[0]+(ci-_pc[0])*s/m),Math.round(_pc[1]+(cj-_pc[1])*s/m));
+    else _mark(ci,cj); }
   else _mark(ci,cj);
   _pc=[ci,cj]; }
 // 最大连通可通行区: 起终点只吸附到此区 -> A* 必有路径
@@ -396,9 +398,12 @@ function renderStatic(){ octx.clearRect(0,0,W,H);
   octx.imageSmoothingEnabled=false;
   const [x0,y0]=p2s(0,0);
   octx.drawImage(base,x0,y0,G*view.scale,G*view.scale);
-  // 轨迹
+  // 轨迹 (跳变段断开, 不画回环/重定位的斜穿直线)
   octx.strokeStyle='rgba(45,226,230,.55)'; octx.lineWidth=1.4; octx.beginPath();
-  D.kf.forEach((k,i)=>{ const[sx,sy]=p2s(k.px[0],k.px[1]); i?octx.lineTo(sx,sy):octx.moveTo(sx,sy); });
+  let _lp=null;
+  D.kf.forEach(k=>{ const[sx,sy]=p2s(k.px[0],k.px[1]);
+    const jump=_lp && Math.max(Math.abs(k.px[0]-_lp[0]),Math.abs(k.px[1]-_lp[1]))>JUMP;
+    (!_lp||jump)?octx.moveTo(sx,sy):octx.lineTo(sx,sy); _lp=k.px; });
   octx.stroke();
   // kf 点
   octx.fillStyle='rgba(45,226,230,.5)';

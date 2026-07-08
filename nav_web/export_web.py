@@ -73,13 +73,14 @@ def main():
         kf_ann[int(k)] = {"cat": v["category"], "name": v.get("name", ""),
                           "conf": round(v.get("confidence", 0), 2)}
 
-    # 缩略图: 从数据集原图按 frame_id 取
+    # 缩略图: 从数据集原图按 frame_id 取。frame_id 是数据集内索引(RGBFiles 按
+    # natsorted 顺序编号), 直接对 natsorted 文件列表按索引取, 兼容任意命名格式
+    # (insight9 的 000123.png / Mapping_C8 的 frame_00123.png)。
+    from natsort import natsorted
+    all_pngs = natsorted(ds.glob("*.png"))
     n_thumb = 0
     for i, fid in enumerate(frame_ids):
-        src = ds / f"{fid:06d}.png"
-        if not src.exists():
-            cands = sorted(ds.glob(f"*{fid}*.png"))
-            src = cands[0] if cands else None
+        src = all_pngs[fid] if fid < len(all_pngs) else None
         if src is None:
             continue
         img = cv2.imread(str(src))
