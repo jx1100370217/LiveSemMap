@@ -22,6 +22,8 @@ from moderngl_window.timers.clock import Timer
 
 from mast3r_slam.frame import Mode
 from mast3r_slam.geometry import get_pixel_coords
+from mast3r_slam.mapping2d import rasterize_map, draw_semantic_nodes
+from mast3r_slam.semantic import aggregate_nodes
 from mast3r_slam.lietorch_utils import as_SE3
 from mast3r_slam.visualization_utils import (
     Frustums,
@@ -45,8 +47,12 @@ class Window(WindowEvents):
     title = "MASt3R-SLAM"
     window_size = (3840, 2160)
 
-    def __init__(self, states, keyframes, main2viz, viz2main, **kwargs):
+    def __init__(self, states, keyframes, main2viz, viz2main, semantic_ann=None, **kwargs):
         super().__init__(**kwargs)
+        # 语义关键帧标注 (主进程语义线程写入的 Manager.dict: kf_idx -> annotation)
+        self.semantic_ann = semantic_ann
+        self.show_semantic = True
+        self._n_sem_nodes = 0
         self.ctx.gc_mode = "auto"
         # bit hacky, but detect whether user is using 4k monitor
         self.scale = 1.0
@@ -428,6 +434,13 @@ class Window(WindowEvents):
         imgui.set_next_window_position(window_size[0] - panel_w - margin, margin)
         imgui.begin("Map View", flags=imgui.WINDOW_NO_SCROLLBAR)
         _, self.show_map = imgui.checkbox("show BEV / occupancy", self.show_map)
+        if self.semantic_ann is not None:
+            imgui.same_line()
+            _, self.show_semantic = imgui.checkbox("semantic", self.show_semantic)
+            imgui.text_ansi(
+                f"semantic: {len(self.semantic_ann)} kf annotated, "
+                f"{self._n_sem_nodes} nodes"
+            )
         avail = imgui.get_content_region_available()
         # 两张方图竖排全部塞进剩余高度: 边长取 宽 与 半高 的较小值 -> 不溢出=无滚动条
         side = max(16.0, min(avail[0], (avail[1] - 12.0 * self.scale) / 2.0))
@@ -570,96 +583,34 @@ class Window(WindowEvents):
             centers.append(M[:3, 3])
         P = np.concatenate(pts, 0)
         C = np.concatenate(cols, 0)
-        centers = np.asarray(centers, np.float32)
-        centers = centers[np.isfinite(centers).all(1)]
+        centers_all = np.asarray(centers, np.float32)  # 与 kf_idx 对齐 (语义节点定位用)
+        centers = centers_all[np.isfinite(centers_all).all(1)]
         ok = np.isfinite(P).all(1) & (np.abs(P) < 1e4).all(1)
         P, C = P[ok], C[ok]
         if len(P) < 20:
             return
-        bev, occ = self._rasterize_map(P, C, centers)
+        bev, occ, _grid, meta = rasterize_map(P, C, centers)
+        # 语义节点叠加: 逐关键帧标注 -> 聚合节点 -> 类别色圆点+中文名画到 BEV/占据图
+        if self.semantic_ann is not None and self.show_semantic:
+            try:
+                ann = dict(self.semantic_ann)
+                pos = {i: centers_all[i] for i in range(N)
+                       if np.isfinite(centers_all[i]).all()}
+                nodes = aggregate_nodes(ann, pos)
+                self._n_sem_nodes = len(nodes)
+                draw_semantic_nodes(bev, nodes, meta)
+                draw_semantic_nodes(occ, nodes, meta, label=False)
+            except Exception:
+                pass
         with self._map_lock:
             self._map_result = (bev, occ)
 
-    def _rasterize_map(self, P, C, centers, G=340):
-        # 自动检测竖直轴 (extent 最小者), 其余两轴为地面 -> 适配 Sim(3) 任意朝向
-        lo, hi = np.percentile(P, 2, 0), np.percentile(P, 98, 0)
-        ext = hi - lo
-        v = int(np.argmin(ext))
-        a, b = [k for k in range(3) if k != v]
-        ca, cb = (lo[a] + hi[a]) / 2, (lo[b] + hi[b]) / 2
-        half = max(ext[a], ext[b]) * 0.55 + 1e-6
 
-        def to_grid(xa, xb):
-            ga = np.clip((xa - (ca - half)) / (2 * half) * G, -1, G).astype(np.int32)
-            gb = np.clip((xb - (cb - half)) / (2 * half) * G, -1, G).astype(np.int32)
-            return ga, gb
-
-        ga, gb = to_grid(P[:, a], P[:, b])
-        inb = (ga >= 0) & (ga < G) & (gb >= 0) & (gb < G)
-        ga, gb, yv, Ci = ga[inb], gb[inb], P[inb, v], C[inb]
-
-        # bincount 累加 (比 np.add.at 快 ~10x)
-        flat = gb.astype(np.int64) * G + ga.astype(np.int64)
-        cnt = np.bincount(flat, minlength=G * G).astype(np.float32).reshape(G, G)
-        acc = np.stack(
-            [np.bincount(flat, weights=Ci[:, c], minlength=G * G) for c in range(3)], -1
-        ).astype(np.float32).reshape(G, G, 3)
-        nz = cnt > 0
-
-        def _dilate(x, k=2):    # 最大值膨胀, 填补稀疏点云的散点空洞
-            o = x.copy()
-            for dy in range(-k, k + 1):
-                for dx in range(-k, k + 1):
-                    o = np.maximum(o, np.roll(np.roll(x, dy, 0), dx, 1))
-            return o
-
-        # BEV 彩色俯瞰: 每格均值真彩 + 两轮 8 邻域填洞去散点
-        bev = np.zeros((G, G, 3), np.float32)
-        bev[nz] = acc[nz] / cnt[nz][:, None]
-        filled = nz.astype(np.float32)
-        for _ in range(2):
-            sc = np.zeros_like(bev)
-            sn = np.zeros((G, G), np.float32)
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    sc += np.roll(np.roll(bev * filled[..., None], dy, 0), dx, 1)
-                    sn += np.roll(np.roll(filled, dy, 0), dx, 1)
-            empty = (filled == 0) & (sn > 0)
-            bev[empty] = sc[empty] / sn[empty][:, None]
-            filled[empty] = 1.0
-        bev[filled == 0] = 0.05     # 未观测=暗底
-
-        # 占据栅格: 中间高度带点=障碍(占比法), 观测到=空闲, 无观测=未知; 膨胀去空洞
-        floor, ceil = np.percentile(yv, 8), np.percentile(yv, 92)
-        rv = max(ceil - floor, 1e-3)
-        # 中段高度带(排除地面与天花板, 避免走廊被天花板点误判为障碍)
-        obst = (yv > floor + 0.20 * rv) & (yv < floor + 0.65 * rv)
-        ocnt = np.bincount(flat[obst], minlength=G * G).astype(np.float32).reshape(G, G)
-        cnt_d, ocnt_d = _dilate(cnt), _dilate(ocnt)
-        occ = np.full((G, G, 3), 0.20, np.float32)      # 未知=灰
-        free = cnt_d > 0
-        occ[free] = np.array([0.82, 0.82, 0.80], np.float32)   # 空闲=亮
-        # 障碍=暗: 中段高度带 ≥2 点 (墙/家具)
-        occ[free & (ocnt_d >= 2)] = np.array([0.10, 0.11, 0.14], np.float32)
-
-        # 叠相机轨迹(青) + 当前相机(品红)
-        if len(centers) > 1:
-            cga, cgb = to_grid(centers[:, a], centers[:, b])
-            cin = (cga >= 0) & (cga < G) & (cgb >= 0) & (cgb < G)
-            traj = np.array([0.18, 0.89, 0.90], np.float32)
-            for im in (bev, occ):
-                im[cgb[cin], cga[cin]] = traj
-            if cin[-1]:
-                yy, xx = int(cgb[-1]), int(cga[-1])
-                mag = np.array([1.0, 0.16, 0.42], np.float32)
-                for im in (bev, occ):
-                    im[max(0, yy - 2):yy + 3, max(0, xx - 2):xx + 3] = mag
-
-        return np.flipud(bev).copy(), np.flipud(occ).copy()
-
-
-def run_visualization(cfg, states, keyframes, main2viz, viz2main) -> None:
+def run_visualization(cfg, states, keyframes, main2viz, viz2main, semantic_ann=None) -> None:
     set_global_config(cfg)
+    # Ctrl-C 属于主进程的"中断并保存"流程; viewer 忽略 SIGINT, 由窗口关闭/TERMINATED 退出
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     config_cls = Window
     backend = "glfw"
@@ -687,6 +638,7 @@ def run_visualization(cfg, states, keyframes, main2viz, viz2main) -> None:
         keyframes=keyframes,
         main2viz=main2viz,
         viz2main=viz2main,
+        semantic_ann=semantic_ann,
         ctx=window.ctx,
         wnd=window,
         timer=timer,

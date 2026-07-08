@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import pathlib
+import signal
 import sys
 import time
 import cv2
@@ -88,6 +89,8 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
 
 def run_backend(cfg, model, states, keyframes, K):
     set_global_config(cfg)
+    # Ctrl-C 发给整个前台进程组: 子进程忽略 SIGINT, 统一由主进程置 TERMINATED 后自然退出
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
@@ -191,6 +194,10 @@ if __name__ == "__main__":
                              "不给=纯RGB(行为不变)")
     parser.add_argument("--snapshot-every", type=int, default=0,
                         help="每 N 个关键帧存一次增量点云快照到 logs/<save_as>/snapshots/ (0=关)")
+    parser.add_argument("--semantic-api", default="http://192.168.50.72:8299/v1",
+                        help="语义标注 vLLM 服务地址(L40 Qwen3.5-9B); 空串=关闭语义标注")
+    parser.add_argument("--no-vpr", action="store_true",
+                        help="退出时跳过 SelaVPR 描述子提取(默认提取, 供导航重定位)")
 
     args = parser.parse_args()
 
@@ -230,10 +237,19 @@ if __name__ == "__main__":
     keyframes = SharedKeyframes(manager, h, w, buffer=(800 if args.vio else 512))
     states = SharedStates(manager, h, w)
 
+    # 语义关键帧标注: 关键帧图像异步送 L40 vLLM 打语义标签, 结果进共享 dict
+    # (viewer 读它画 BEV 语义节点; 退出时聚合保存 semantic.json)
+    semantic_ann = manager.dict()
+    annotator = None
+    if args.semantic_api:
+        from mast3r_slam.semantic import SemanticAnnotator
+        annotator = SemanticAnnotator(args.semantic_api, semantic_ann)
+        print(f"[semantic] 语义标注已启用: {args.semantic_api}")
+
     if not args.no_viz:
         viz = mp.Process(
             target=run_visualization,
-            args=(config, states, keyframes, main2viz, viz2main),
+            args=(config, states, keyframes, main2viz, viz2main, semantic_ann),
         )
         viz.start()
 
@@ -269,6 +285,17 @@ if __name__ == "__main__":
     backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
     backend.start()
 
+    # 中断安全: Ctrl-C 不再直接抛 KeyboardInterrupt 跳过保存, 而是置 TERMINATED
+    # 让主循环正常 break -> 走完整保存流程(点云/轨迹/语义地图/描述子)。再按一次强退。
+    def _on_sigint(sig, frm):
+        if states.get_mode() == Mode.TERMINATED:
+            print("\n[中断] 再次 Ctrl-C, 强制退出(本次不保存)")
+            sys.exit(1)
+        print("\n[中断] 收到 Ctrl-C: 停止建图, 保存已建好的地图产物...")
+        states.set_mode(Mode.TERMINATED)
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
     i = 0
     fps_timer = time.time()
 
@@ -284,6 +311,8 @@ if __name__ == "__main__":
 
     while True:
         mode = states.get_mode()
+        if mode == Mode.TERMINATED:  # SIGINT / viewer 终止 -> 跳出去走保存流程
+            break
         msg = try_get_msg(viz2main)
         if msg is not None and getattr(msg, "reset", False):
             # 重新建图: 清空关键帧/状态/跟踪器, 从第 0 帧重来
@@ -292,6 +321,8 @@ if __name__ == "__main__":
             with keyframes.lock:
                 keyframes.n_size.value = 0
             tracker = FrameTracker(model, keyframes, device)
+            if annotator is not None:  # 语义标注同步清零(kf_idx 从 0 复用)
+                annotator.reset()
             i = 0
             fps_timer = time.time()
             next_snap = args.snapshot_every  # 快照序号也重新开始
@@ -371,6 +402,9 @@ if __name__ == "__main__":
             if vio_prior is not None:
                 vio_prior.note_keyframe(i)
             states.queue_global_optimization(len(keyframes) - 1)
+        # 语义标注追赶式提交: 覆盖 INIT/TRACKING/backend重定位 三种关键帧来源
+        if annotator is not None:
+            annotator.catch_up(keyframes)
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:
@@ -414,6 +448,15 @@ if __name__ == "__main__":
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
         )
+        # 语义地图 + 占据栅格 + VPR 描述子 (中断/正常退出统一走到这里)
+        if annotator is not None:
+            annotator.drain()
+        eval.save_semantic_map(
+            save_dir, seq_name, keyframes, semantic_ann, vio_prior,
+            last_msg.C_conf_threshold,
+        )
+        if not args.no_vpr:
+            eval.save_vpr_descriptors(save_dir, seq_name, keyframes)
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")
         savedir.mkdir(exist_ok=True, parents=True)
