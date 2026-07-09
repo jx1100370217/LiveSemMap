@@ -150,13 +150,15 @@ def locate_image():
 
 
 def main():
+    from mast3r_slam.run_config import load_run_config, run_dir, seq_name
+    rc = load_run_config()  # 默认值取自 nav_config.yaml, CLI 参数优先
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True)
-    ap.add_argument("--seq", required=True)
-    ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--api", default="http://192.168.50.72:8299/v1",
+    ap.add_argument("--run", default=str(run_dir(rc)))
+    ap.add_argument("--seq", default=seq_name(rc))
+    ap.add_argument("--port", type=int, default=int(rc.get("web_port", 8080)))
+    ap.add_argument("--api", default=rc.get("semantic_api", "http://192.168.50.72:8299/v1"),
                     help="vLLM 服务(自然语言匹配用)")
-    ap.add_argument("--model", default="qwen3.5-35b-a3b")
+    ap.add_argument("--model", default=rc.get("semantic_model", "qwen3.5-35b-a3b"))
     args = ap.parse_args()
     CFG.update(run=pathlib.Path(args.run).resolve(), seq=args.seq,
                api=args.api, model=args.model)

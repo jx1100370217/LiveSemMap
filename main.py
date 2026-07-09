@@ -182,20 +182,25 @@ if __name__ == "__main__":
     save_frames = False
     datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
+    # 默认值取自 nav_config.yaml (配置一次, 三个入口脚本零参数运行); CLI 参数优先
+    from mast3r_slam.run_config import load_run_config
+    rc = load_run_config()
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="datasets/insight9")
-    parser.add_argument("--config", default="config/insight9.yaml")
-    parser.add_argument("--save-as", default="default")
+    parser.add_argument("--dataset", default=rc.get("dataset", "datasets/insight9"))
+    parser.add_argument("--config", default=rc.get("config", "config/insight9.yaml"))
+    parser.add_argument("--save-as", default=rc.get("save_as", "default"))
     parser.add_argument("--no-viz", default=False)
-    parser.add_argument("--calib", default="config/intrinsics_insight9.yaml")
-    # parser.add_argument("--vio", default=None,
-    parser.add_argument("--vio", default="datasets/insight9/vio.txt",
+    parser.add_argument("--calib", default=rc.get("calib", "config/intrinsics_insight9.yaml"))
+    parser.add_argument("--vio", default=rc.get("vio", ""),
                         help="方案B: VIO 度量轨迹(vio.txt, 同目录需 timestamps.txt), 给跟踪做运动补偿位姿先验; "
                              "不给=纯RGB(行为不变)")
     parser.add_argument("--snapshot-every", type=int, default=0,
                         help="每 N 个关键帧存一次增量点云快照到 logs/<save_as>/snapshots/ (0=关)")
-    parser.add_argument("--semantic-api", default="http://192.168.50.72:8299/v1",
-                        help="语义标注 vLLM 服务地址(L40 Qwen3.5-9B); 空串=关闭语义标注")
+    parser.add_argument("--semantic-api",
+                        default=rc.get("semantic_api", "http://192.168.50.72:8299/v1"),
+                        help="语义标注 vLLM 服务地址; 空串=关闭语义标注")
+    parser.add_argument("--semantic-model", default=rc.get("semantic_model", "qwen3.5-35b-a3b"))
     parser.add_argument("--no-vpr", action="store_true",
                         help="退出时跳过 SelaVPR 描述子提取(默认提取, 供导航重定位)")
 
@@ -243,8 +248,9 @@ if __name__ == "__main__":
     annotator = None
     if args.semantic_api:
         from mast3r_slam.semantic import SemanticAnnotator
-        annotator = SemanticAnnotator(args.semantic_api, semantic_ann)
-        print(f"[semantic] 语义标注已启用: {args.semantic_api}")
+        annotator = SemanticAnnotator(args.semantic_api, semantic_ann,
+                                      model=args.semantic_model)
+        print(f"[semantic] 语义标注已启用: {args.semantic_api} ({args.semantic_model})")
 
     if not args.no_viz:
         viz = mp.Process(

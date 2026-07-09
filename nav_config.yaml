@@ -1,0 +1,29 @@
+# ============================================================
+# 语义建图 + 导航 统一运行配置
+# 只需改这一个文件, 然后依次零参数执行:
+#   python main.py                 # 增量语义建图 (Ctrl-C 可随时中断保存)
+#   python nav_web/export_web.py   # 导出导航 Web 数据
+#   python nav_web/server.py       # 启动可视化导航 (浏览器打开 http://localhost:<web_port>)
+# 命令行参数仍可用且优先于本文件。
+# ============================================================
+
+# ---- 数据集: insight9 (VIO 米制) ----
+dataset: datasets/insight9
+config: config/insight9.yaml
+calib: config/intrinsics_insight9.yaml
+vio: datasets/insight9/vio.txt      # VIO 度量轨迹; 纯 RGB 数据集置空 ""
+save_as: insight9_run               # 产物目录 logs/<save_as>/
+
+# ---- 数据集: Mapping_C8 (纯 RGB, 用时取消注释并注释掉上面一组) ----
+# dataset: datasets/Mapping_C8
+# config: config/mapping_c8.yaml
+# calib: config/intrinsics_c8.yaml
+# vio: ""
+# save_as: c8_run
+
+# ---- 语义标注 (L40 vLLM) ----
+semantic_api: http://192.168.50.72:8299/v1   # 置空 "" 关闭语义标注
+semantic_model: qwen3.5-35b-a3b
+
+# ---- 导航 Web ----
+web_port: 8080

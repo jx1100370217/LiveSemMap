@@ -21,15 +21,19 @@ import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from mast3r_slam.semantic import SEMANTIC_CATEGORIES  # noqa: E402
+from mast3r_slam.run_config import load_run_config, run_dir, seq_name  # noqa: E402
 
 
 def main():
+    rc = load_run_config()  # 默认值取自 nav_config.yaml, CLI 参数优先
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True, help="运行产物目录, 如 logs/semantic_v1")
-    ap.add_argument("--seq", required=True, help="序列名, 如 insight9")
-    ap.add_argument("--dataset", required=True, help="数据集目录(取原图做缩略图)")
+    ap.add_argument("--run", default=str(run_dir(rc)), help="运行产物目录, 如 logs/insight9_run")
+    ap.add_argument("--seq", default=seq_name(rc), help="序列名, 如 insight9")
+    ap.add_argument("--dataset", default=rc.get("dataset", "datasets/insight9"),
+                    help="数据集目录(取原图做缩略图)")
     ap.add_argument("--thumb-width", type=int, default=360)
     args = ap.parse_args()
+    print(f"[export_web] run={args.run} seq={args.seq} dataset={args.dataset}")
 
     run = pathlib.Path(args.run)
     ds = pathlib.Path(args.dataset)
