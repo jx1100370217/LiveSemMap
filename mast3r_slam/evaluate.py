@@ -127,10 +127,13 @@ def save_reconstruction_vio(savedir, filename, keyframes, vio_prior, c_conf_thre
     print(f"[VIO重建] 尺度 s={s:.4f} m/单位, {len(P)} 点 -> {filename} (无漂移米制图)")
 
 
-def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):
+def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes, start=0):
+    """写关键帧图像; start>0 时只写新增部分(增量保存用, 图像入容器后不再变)。
+    返回已写到的关键帧数, 供调用方作为下次 start。"""
     savedir = pathlib.Path(savedir)
     savedir.mkdir(exist_ok=True, parents=True)
-    for i in range(len(keyframes)):
+    n = len(keyframes)
+    for i in range(start, n):
         keyframe = keyframes[i]
         t = timestamps[keyframe.frame_id]
         filename = savedir / f"{t}.png"
@@ -140,6 +143,7 @@ def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):
                 (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR
             ),
         )
+    return n
 
 
 def _kf_world_geometry(keyframes, vio_prior, c_conf_threshold, stride=6):
@@ -193,7 +197,7 @@ def _kf_world_geometry(keyframes, vio_prior, c_conf_threshold, stride=6):
 
 
 def save_semantic_map(savedir, seq_name, keyframes, semantic_ann, vio_prior,
-                      c_conf_threshold, G=480):
+                      c_conf_threshold, G=480, verbose=True):
     """保存 2D 语义地图产物 (中断/正常退出统一入口):
     - occupancy.npz: 原始占据栅格(0未知/1可通行/2障碍) + 世界<->像素 meta + 关键帧位置
     - bev.png / occupancy.png: 彩色俯视图与占据图 (含语义节点高亮+中文标签)
@@ -224,28 +228,39 @@ def save_semantic_map(savedir, seq_name, keyframes, semantic_ann, vio_prior,
 
     kf_px, kf_py = world_to_px(kf_pos, meta)
     frame_ids = [int(keyframes.dataset_idx[i]) for i in range(N)]
-    np.savez_compressed(
-        savedir / f"{seq_name}_occupancy.npz",
-        grid=grid, meta=json.dumps(meta), kf_pos=kf_pos,
+
+    # 原子写: 先写 tmp_ 前缀文件再 rename —— 增量保存周期重写这些文件,
+    # kill -9 / 并发读(export_web) 不会撞上写了一半的产物。
+    # 临时名保持真实扩展名 (np.savez 会给非 .npz 路径追加后缀, cv2.imwrite 按扩展名选编码器)
+    def _atomic(path, write_fn):
+        tmp = path.with_name("tmp_" + path.name)
+        write_fn(tmp)
+        tmp.replace(path)
+
+    _atomic(savedir / f"{seq_name}_occupancy.npz", lambda p: np.savez_compressed(
+        p, grid=grid, meta=json.dumps(meta), kf_pos=kf_pos,
         kf_px=np.stack([kf_px, kf_py], 1), frame_ids=np.array(frame_ids),
-        coordinate=coord,
-    )
-    cv2.imwrite(str(savedir / f"{seq_name}_bev.png"),
-                cv2.cvtColor((np.clip(bev, 0, 1) * 255).astype(np.uint8),
-                             cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(savedir / f"{seq_name}_occupancy.png"),
-                cv2.cvtColor((np.clip(occ, 0, 1) * 255).astype(np.uint8),
-                             cv2.COLOR_RGB2BGR))
-    with open(savedir / f"{seq_name}_semantic.json", "w") as f:
-        json.dump({
-            "coordinate": coord,
-            "nodes": nodes,
-            "annotations": {str(k): v for k, v in sorted(ann.items())},
-            "kf_positions": kf_pos.tolist(),
-            "frame_ids": frame_ids,
-        }, f, ensure_ascii=False, indent=1)
-    print(f"[semantic_map] {len(nodes)} 个语义节点, 栅格 {G}x{G} ({coord} 系) -> "
-          f"{seq_name}_semantic.json / _occupancy.npz / _bev.png")
+        coordinate=coord))
+    _atomic(savedir / f"{seq_name}_bev.png", lambda p: cv2.imwrite(
+        str(p), cv2.cvtColor((np.clip(bev, 0, 1) * 255).astype(np.uint8),
+                             cv2.COLOR_RGB2BGR)))
+    _atomic(savedir / f"{seq_name}_occupancy.png", lambda p: cv2.imwrite(
+        str(p), cv2.cvtColor((np.clip(occ, 0, 1) * 255).astype(np.uint8),
+                             cv2.COLOR_RGB2BGR)))
+
+    def _write_json(p):
+        with open(p, "w") as f:
+            json.dump({
+                "coordinate": coord,
+                "nodes": nodes,
+                "annotations": {str(k): v for k, v in sorted(ann.items())},
+                "kf_positions": kf_pos.tolist(),
+                "frame_ids": frame_ids,
+            }, f, ensure_ascii=False, indent=1)
+    _atomic(savedir / f"{seq_name}_semantic.json", _write_json)
+    if verbose:
+        print(f"[semantic_map] {len(nodes)} 个语义节点, 栅格 {G}x{G} ({coord} 系) -> "
+              f"{seq_name}_semantic.json / _occupancy.npz / _bev.png")
     return nodes
 
 

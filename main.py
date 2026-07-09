@@ -292,15 +292,35 @@ if __name__ == "__main__":
     backend.start()
 
     # 中断安全: Ctrl-C 不再直接抛 KeyboardInterrupt 跳过保存, 而是置 TERMINATED
-    # 让主循环正常 break -> 走完整保存流程(点云/轨迹/语义地图/描述子)。再按一次强退。
+    # 让主循环正常 break -> 走完整保存流程(点云/轨迹/语义地图/描述子)。
+    # 保存进行中(已 TERMINATED)再按: 先警告一次, 又按才强退 —— 防止把
+    # "保存中" 误当 "卡死" 一次 Ctrl-C 就丢产物。
+    _sigint_n = {"n": 0}
+
     def _on_sigint(sig, frm):
         if states.get_mode() == Mode.TERMINATED:
-            print("\n[中断] 再次 Ctrl-C, 强制退出(本次不保存)")
+            _sigint_n["n"] += 1
+            if _sigint_n["n"] == 1:
+                print("\n[中断] 正在保存地图产物(见 [save x/7] 进度), 请稍候; "
+                      "再按一次 Ctrl-C 才会强制退出并丢失未保存产物", flush=True)
+                return
+            print("\n[中断] 再次 Ctrl-C, 强制退出(剩余产物不保存)", flush=True)
             sys.exit(1)
-        print("\n[中断] 收到 Ctrl-C: 停止建图, 保存已建好的地图产物...")
+        print("\n[中断] 收到 Ctrl-C: 停止建图, 保存已建好的地图产物...", flush=True)
         states.set_mode(Mode.TERMINATED)
 
     signal.signal(signal.SIGINT, _on_sigint)
+
+    # 增量产物保存: 建图过程中每 20s 把导航所需产物(轨迹/占据栅格/语义/关键帧图像)
+    # 落盘 —— 随时中断(关窗口/Ctrl-C/kill -9)都有截止当时的完整可导航地图
+    inc_saver = None
+    if dataset.save_results:
+        from mast3r_slam.incremental_saver import IncrementalSaver
+        _sd, _sn = eval.prepare_savedir(args, dataset)
+        inc_saver = IncrementalSaver(
+            _sd, _sn, keyframes, semantic_ann, vio_prior, dataset.timestamps,
+            get_conf_threshold=lambda: last_msg.C_conf_threshold)
+        inc_saver.start()
 
     i = 0
     fps_timer = time.time()
@@ -329,6 +349,8 @@ if __name__ == "__main__":
             tracker = FrameTracker(model, keyframes, device)
             if annotator is not None:  # 语义标注同步清零(kf_idx 从 0 复用)
                 annotator.reset()
+            if inc_saver is not None:
+                inc_saver.reset()
             i = 0
             fps_timer = time.time()
             next_snap = args.snapshot_every  # 快照序号也重新开始
@@ -439,30 +461,48 @@ if __name__ == "__main__":
 
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
-        eval.save_keyframe_poses(save_dir, f"{seq_name}_kf_poses.txt", dataset.timestamps, keyframes)
-        eval.save_reconstruction(
-            save_dir,
-            f"{seq_name}.ply",
-            keyframes,
-            last_msg.C_conf_threshold,
-        )
+        if inc_saver is not None:
+            inc_saver.stop()   # 停周期线程, 避免与下面的最终全量保存并发写
+
+        # 每步独立容错: 单步失败打印堆栈后继续存后面的产物, 不再整链断掉
+        def _save_step(idx, total, name, fn):
+            print(f"[save {idx}/{total}] {name} ...", flush=True)
+            try:
+                t0 = time.time()
+                fn()
+                print(f"[save {idx}/{total}] {name} 完成 ({time.time() - t0:.1f}s)", flush=True)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                print(f"[save {idx}/{total}] {name} 失败, 跳过并继续保存其余产物", flush=True)
+
+        n_steps = 7
+        print(f"[save] 开始保存全部地图产物到 {save_dir} (共 {n_steps} 步, "
+              f"约 1-3 分钟, 请勿关闭终端; 此时按 Ctrl-C 会丢失未保存产物)", flush=True)
+        _save_step(1, n_steps, "轨迹", lambda: eval.save_traj(
+            save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes))
+        _save_step(2, n_steps, "关键帧位姿", lambda: eval.save_keyframe_poses(
+            save_dir, f"{seq_name}_kf_poses.txt", dataset.timestamps, keyframes))
+        _save_step(3, n_steps, "稠密点云 PLY", lambda: eval.save_reconstruction(
+            save_dir, f"{seq_name}.ply", keyframes, last_msg.C_conf_threshold))
         if vio_prior is not None:  # 方案B: 额外存一份 VIO 位姿重建(治漂移)
-            eval.save_reconstruction_vio(
-                save_dir, f"{seq_name}_vio.ply", keyframes, vio_prior, last_msg.C_conf_threshold
-            )
-        eval.save_keyframes(
-            save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
-        )
+            _save_step(4, n_steps, "VIO 米制点云", lambda: eval.save_reconstruction_vio(
+                save_dir, f"{seq_name}_vio.ply", keyframes, vio_prior,
+                last_msg.C_conf_threshold))
+        else:
+            print(f"[save 4/{n_steps}] 无 VIO, 跳过米制点云", flush=True)
+        _save_step(5, n_steps, "关键帧图像", lambda: eval.save_keyframes(
+            save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes))
         # 语义地图 + 占据栅格 + VPR 描述子 (中断/正常退出统一走到这里)
         if annotator is not None:
             annotator.drain()
-        eval.save_semantic_map(
+        _save_step(6, n_steps, "语义地图/占据栅格", lambda: eval.save_semantic_map(
             save_dir, seq_name, keyframes, semantic_ann, vio_prior,
-            last_msg.C_conf_threshold,
-        )
+            last_msg.C_conf_threshold))
         if not args.no_vpr:
-            eval.save_vpr_descriptors(save_dir, seq_name, keyframes)
+            _save_step(7, n_steps, "SelaVPR 描述子", lambda: eval.save_vpr_descriptors(
+                save_dir, seq_name, keyframes))
+        print(f"[save] 产物保存流程结束 -> {save_dir}", flush=True)
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")
         savedir.mkdir(exist_ok=True, parents=True)

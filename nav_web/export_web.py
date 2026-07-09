@@ -96,6 +96,31 @@ def main():
                     [cv2.IMWRITE_JPEG_QUALITY, 82])
         n_thumb += 1
 
+    # VPR 描述子兜底: 建图被中断时(增量保存只写轻产物)描述子缺失,
+    # 这里从数据集原图按 frame_ids 自动补提取, 保证图像定位起点功能可用
+    desc_path = run / f"{args.seq}_vpr_desc.npy"
+    if not desc_path.exists():
+        print(f"[export_web] 缺 {desc_path.name}, 自动补提取 SelaVPR 描述子...")
+        try:
+            import torch
+            from natsort import natsorted as _ns
+            from mast3r_slam.selavpr import SelaVPRExtractor
+            ex = SelaVPRExtractor(backbone="dinov2-large", use_hashing=False,
+                                  use_rerank=False, device="cuda:0")
+            if isinstance(ex.model, torch.nn.DataParallel):
+                ex.model = ex.model.module.to("cuda:0")
+            pngs = _ns(ds.glob("*.png"))
+            bgrs = [cv2.imread(str(pngs[f])) for f in frame_ids if f < len(pngs)]
+            out = []
+            for i in range(0, len(bgrs), 12):
+                out.append(ex.extract_batch(bgrs[i:i + 12]))
+            D = np.concatenate(out, 0).astype(np.float32)
+            D /= np.linalg.norm(D, axis=1, keepdims=True) + 1e-9
+            np.save(desc_path, D)
+            print(f"[export_web] 描述子 {D.shape} -> {desc_path.name}")
+        except Exception as e:
+            print(f"[export_web] 补提取失败(图像定位功能不可用, 其余不受影响): {e}")
+
     # grid 压成每行字符串 ('0'/'1'/'2'), gzip 由 HTTP 层做
     grid_rows = ["".join(map(str, row.tolist())) for row in grid]
 
