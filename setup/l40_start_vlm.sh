@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=${GPU_IDS} vllm serve "${MODEL_PATH}" \
     --dtype bfloat16 \
     --tensor-parallel-size ${TP} \
     --max-model-len 8192 \
-    --max-num-seqs 4 \
+    --max-num-seqs 8 \
     --gpu-memory-utilization 0.30 \
     --enable-prefix-caching \
     --served-model-name qwen3.5-9b \
