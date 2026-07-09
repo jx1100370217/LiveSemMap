@@ -44,7 +44,7 @@ class WindowMsg:
 
 
 class Window(WindowEvents):
-    title = "MASt3R-SLAM"
+    title = "LiveSemMap"
     window_size = (3840, 2160)
 
     def __init__(self, states, keyframes, main2viz, viz2main, semantic_ann=None, **kwargs):
