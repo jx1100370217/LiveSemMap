@@ -156,7 +156,7 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api", default="http://192.168.50.72:8299/v1",
                     help="vLLM 服务(自然语言匹配用)")
-    ap.add_argument("--model", default="qwen3.5-9b")
+    ap.add_argument("--model", default="qwen3.5-35b-a3b")
     args = ap.parse_args()
     CFG.update(run=pathlib.Path(args.run).resolve(), seq=args.seq,
                api=args.api, model=args.model)
