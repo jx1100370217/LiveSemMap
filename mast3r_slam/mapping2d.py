@@ -58,8 +58,9 @@ def occupancy_vis(grid, traj_cell):
         small = (sz <= 60) & (obs * 2 < sz)
         small[edge] = False
         fl |= small[hole_lab]
-    corr = ndi.binary_dilation(traj_cell, _disk(3)) & ~(~fl & (grid == 2))
-    wall = (grid == 2) & ~fl & ndi.binary_dilation(fl, np.ones((3, 3), bool)) \
+    # 走廊带不被障碍擦除: 机器人走过=事实可走, 起始段点云稀时曾被擦成"隐形走廊"
+    corr = ndi.binary_dilation(traj_cell, _disk(3))
+    wall = (grid == 2) & ~fl & ~corr & ndi.binary_dilation(fl, np.ones((3, 3), bool)) \
         & ndi.binary_dilation(traj_cell, _disk(9))
 
     occ = np.full((*grid.shape, 3), (0.051, 0.067, 0.102), np.float32)  # 未知
