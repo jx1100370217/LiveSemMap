@@ -343,20 +343,76 @@ function resize(){ W=cv.clientWidth; H=cv.clientHeight;
   staticDirty=true; }
 window.addEventListener('resize',()=>{resize();});
 
-// 占据底图预渲染到 G×G 位图
-const base=document.createElement('canvas'); base.width=G; base.height=G;
-(function(){ const bctx=base.getContext('2d'), im=bctx.createImageData(G,G);
-  const CU=[16,22,34], CF=[142,158,178], CB=[36,42,56];  // 未知/可通行/障碍(墙)
-  for(let i=0;i<G*G;i++){ const v=grid[i];
-    let c = v===1?CF : (v===2?CB:CU);
-    if(v===2){ // 只有贴近可通行区的障碍画成亮墙(滤远处噪声碎片)
-      const ci=(i/G)|0,cj=i%G; let near=false;
-      for(let d=-2;d<=2&&!near;d++)for(let e=-2;e<=2;e++){
-        const ni=ci+d,nj=cj+e;
-        if(ni>=0&&ni<G&&nj>=0&&nj<G&&grid[ni*G+nj]===1){near=true;break;} }
-      c = near?[230,238,248]:CB; }
-    im.data[i*4]=c[0];im.data[i*4+1]=c[1];im.data[i*4+2]=c[2];im.data[i*4+3]=255; }
-  bctx.putImageData(im,0,0); })();
+// 占据底图预渲染 (仅视觉层, 不影响 blocked/A*/吸附等导航数据):
+// 1) 只把与机器人轨迹连通的 free 画成地板色 —— 室外噪声点云造成的大量
+//    孤立"伪空闲"碎片(雪花状)与孤立障碍块一律沉入未知色;
+// 2) 地板区内的小孔洞(未知噪点)邻域投票填平;
+// 3) 墙只描贴着地板的障碍格 -> 干净的建筑轮廓线;
+// 4) G×G 位图 4x 平滑超采样, 消掉最近邻放大的马赛克块。
+const BASE_SS=4;
+const base=document.createElement('canvas'); base.width=G*BASE_SS; base.height=G*BASE_SS;
+(function(){
+  const vis=new Uint8Array(G*G);           // 0=未知 1=地板 2=墙
+  const st=[];
+  for(let i=0;i<G*G;i++) if(trajCell[i]){ vis[i]=1; st.push(i); }
+  while(st.length){ const c=st.pop(), ci=(c/G)|0, cj=c%G;   // 轨迹连通 free 洪泛
+    for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++){
+      const ni=ci+di, nj=cj+dj;
+      if(ni<0||ni>=G||nj<0||nj>=G) continue;
+      const id=ni*G+nj;
+      if(!vis[id]&&grid[id]===1){ vis[id]=1; st.push(id); } } }
+  const morph=(src,val)=>{ const out=new Uint8Array(src);   // 3x3 膨胀(val=1)/腐蚀(val=0)
+    for(let i=0;i<G;i++)for(let j=0;j<G;j++){ const id=i*G+j;
+      if((src[id]===1)===(val===1)) continue;
+      for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++){
+        const ni=i+di, nj=j+dj;
+        if(ni>=0&&ni<G&&nj>=0&&nj<G&&src[ni*G+nj]===(val===1?1:0)){ out[id]=val; di=2; break; } } }
+    return out; };
+  let fl=morph(morph(vis,1),0);                              // 闭运算: 平滑边缘/弥小缝
+  (function(){                                               // 地板内小岛(噪声障碍/未知孔)并入地板
+    const seen=new Uint8Array(G*G);
+    for(let s=0;s<G*G;s++){ if(fl[s]||seen[s]) continue;
+      const st2=[s], cells=[]; seen[s]=1; let touch=false;
+      while(st2.length){ const c=st2.pop(); cells.push(c);
+        const ci=(c/G)|0, cj=c%G;
+        if(ci===0||ci===G-1||cj===0||cj===G-1) touch=true;   // 贴图边=外部, 不算岛
+        for(const[di,dj]of[[-1,0],[1,0],[0,-1],[0,1]]){
+          const ni=ci+di, nj=cj+dj;
+          if(ni<0||ni>=G||nj<0||nj>=G) continue;
+          const id=ni*G+nj;
+          if(!fl[id]&&!seen[id]){ seen[id]=1; st2.push(id); } } }
+      if(!touch&&cells.length<=60){
+        const nob=cells.reduce((a,c)=>a+(grid[c]===2),0);   // 多数为真障碍(柱)则保留
+        if(nob*2<cells.length) cells.forEach(id=>fl[id]=1); } } })();
+  const dilateC=(src,R)=>{ const out=new Uint8Array(G*G);    // 圆形核膨胀(圆角带, 无方角)
+    for(let i=0;i<G;i++)for(let j=0;j<G;j++){ if(!src[i*G+j]) continue;
+      for(let di=-R;di<=R;di++)for(let dj=-R;dj<=R;dj++){
+        if(di*di+dj*dj>R*R) continue;
+        const ni=i+di, nj=j+dj;
+        if(ni>=0&&ni<G&&nj>=0&&nj<G) out[ni*G+nj]=1; } }
+    return out; };
+  const corr=dilateC(trajCell,3);                            // 走廊带: 轨迹圆核膨胀 ~1m
+  for(let i=0;i<G*G;i++) if(corr[i]&&!fl[i]&&grid[i]===2) corr[i]=0;  // 不盖真障碍
+  const wz=dilateC(trajCell,9);                              // 墙线绘制区: 走廊外扩 ~2.7m
+  const sm=document.createElement('canvas'); sm.width=G; sm.height=G;
+  const sctx=sm.getContext('2d'), im=sctx.createImageData(G,G);
+  // 视觉层次: 未知(暗) < 观测区(微亮) < 走廊带(亮, 机器人真实走过) < 墙(白线)
+  const CU=[13,17,26], CO=[30,37,53], CF=[74,88,114], CW=[203,218,240], CE=[24,30,44];
+  for(let i=0;i<G;i++)for(let j=0;j<G;j++){ const id=i*G+j;
+    let c=CU;
+    if(corr[id]) c=CF;
+    else if(fl[id]) c=CO;
+    else if(wz[id]){ let near=false;                         // 走廊附近的观测区边界: 真障碍=亮墙
+      for(let di=-1;di<=1&&!near;di++)for(let dj=-1;dj<=1;dj++){
+        const ni=i+di, nj=j+dj;
+        if(ni>=0&&ni<G&&nj>=0&&nj<G&&fl[ni*G+nj]){near=true;break;} }
+      if(near) c=(grid[id]===2)?CW:CE; }
+    im.data[id*4]=c[0];im.data[id*4+1]=c[1];im.data[id*4+2]=c[2];im.data[id*4+3]=255; }
+  sctx.putImageData(im,0,0);
+  const bctx=base.getContext('2d');
+  bctx.imageSmoothingEnabled=true; bctx.imageSmoothingQuality='high';
+  bctx.drawImage(sm,0,0,G*BASE_SS,G*BASE_SS);
+})();
 
 // ---- 状态 ----
 let mode='idle';           // idle | pickS | pickG
@@ -466,9 +522,15 @@ function updateFPV(){ const p=robot? robot.pos : (start? [start.x,start.y]:null)
 
 // ---- 渲染 ----
 function renderStatic(){ octx.clearRect(0,0,W,H);
-  octx.imageSmoothingEnabled=false;
+  octx.imageSmoothingEnabled=true; octx.imageSmoothingQuality='high';  // base 是 4x 超采样图
   const [x0,y0]=p2s(0,0);
   octx.drawImage(base,x0,y0,G*view.scale,G*view.scale);
+  // 世界系淡网格 (10m/10u 间隔, 图纸感)
+  const gstep=10/MPP*view.scale;
+  if(gstep>26){ octx.strokeStyle='rgba(126,158,200,.05)'; octx.lineWidth=1; octx.beginPath();
+    for(let x=((x0%gstep)+gstep)%gstep;x<W;x+=gstep){ octx.moveTo(x,0); octx.lineTo(x,H); }
+    for(let y=((y0%gstep)+gstep)%gstep;y<H;y+=gstep){ octx.moveTo(0,y); octx.lineTo(W,y); }
+    octx.stroke(); }
   // 轨迹 (跳变段断开, 不画回环/重定位的斜穿直线)
   octx.strokeStyle='rgba(45,226,230,.55)'; octx.lineWidth=1.4; octx.beginPath();
   let _lp=null;
@@ -476,23 +538,36 @@ function renderStatic(){ octx.clearRect(0,0,W,H);
     const jump=_lp && Math.max(Math.abs(k.px[0]-_lp[0]),Math.abs(k.px[1]-_lp[1]))>JUMP;
     (!_lp||jump)?octx.moveTo(sx,sy):octx.lineTo(sx,sy); _lp=k.px; });
   octx.stroke();
-  // kf 点
-  octx.fillStyle='rgba(45,226,230,.5)';
-  D.kf.forEach(k=>{ const[sx,sy]=p2s(k.px[0],k.px[1]); octx.fillRect(sx-1,sy-1,2,2); });
-  // 语义节点
+  // kf 点 (小倍率下密集成链珠噪声, 放大后才显示)
+  if(view.scale>1.6){ octx.fillStyle='rgba(45,226,230,.3)';
+    D.kf.forEach(k=>{ const[sx,sy]=p2s(k.px[0],k.px[1]); octx.fillRect(sx-1,sy-1,2,2); }); }
+  // 语义节点 + 胶囊标签 (贪心防重叠: 与已放标签相交则隐藏, 选中/悬停强制显示)
+  const placed=[];
   D.nodes.forEach((n,i)=>{ const[sx,sy]=p2s(n.px[0],n.px[1]);
-    const r=(i===selNode||i===hoverNode)?10:7;
+    const act=(i===selNode||i===hoverNode), r=act?10:7;
     octx.save();
-    octx.shadowColor=n.color; octx.shadowBlur=(i===selNode||i===hoverNode)?22:12;
+    octx.shadowColor=n.color; octx.shadowBlur=act?22:12;
     octx.fillStyle=n.color; octx.beginPath(); octx.arc(sx,sy,r,0,7); octx.fill();
     octx.restore();
     octx.strokeStyle='rgba(255,255,255,.75)'; octx.lineWidth=1.5;
     octx.beginPath(); octx.arc(sx,sy,r,0,7); octx.stroke();
-    if(view.scale>1.1||i===selNode||i===hoverNode){
-      octx.font='600 12px "JetBrains Mono",monospace';
-      octx.fillStyle='#0a0f18'; octx.strokeStyle='rgba(6,10,18,.9)'; octx.lineWidth=3;
-      octx.strokeText(n.name,sx+12,sy+4);
-      octx.fillStyle='#fff'; octx.fillText(n.name,sx+12,sy+4); } });
+    if(view.scale>1.1||act){
+      octx.font='600 11px "JetBrains Mono",monospace';
+      const tw=octx.measureText(n.name).width, bx=sx+11, by=sy-9, bw=tw+12, bh=18;
+      const hit=placed.some(p=>bx<p[0]+p[2]&&bx+bw>p[0]&&by<p[1]+p[3]&&by+bh>p[1]);
+      if(!hit||act){ placed.push([bx,by,bw,bh]);
+        octx.fillStyle='rgba(9,14,24,.78)';
+        octx.beginPath(); octx.roundRect(bx,by,bw,bh,9); octx.fill();
+        octx.strokeStyle='rgba(140,170,210,.28)'; octx.lineWidth=1; octx.stroke();
+        octx.fillStyle='#e8eefb'; octx.fillText(n.name,bx+6,by+13); } } });
+  // 比例尺 (右下)
+  const cand=[1,2,5,10,20,50,100], sv=cand.find(c=>c/MPP*view.scale>=70)||100;
+  const sl=sv/MPP*view.scale, bx2=W-sl-72, by2=H-18;
+  octx.strokeStyle='rgba(210,225,245,.7)'; octx.lineWidth=2; octx.beginPath();
+  octx.moveTo(bx2,by2-4); octx.lineTo(bx2,by2); octx.lineTo(bx2+sl,by2); octx.lineTo(bx2+sl,by2-4);
+  octx.stroke();
+  octx.font='600 10px "JetBrains Mono",monospace'; octx.fillStyle='rgba(210,225,245,.7)';
+  octx.fillText(sv+(isMetric?' m':' u'), bx2+sl+7, by2+2);
   staticDirty=false; }
 
 function render(){ if(staticDirty) renderStatic();

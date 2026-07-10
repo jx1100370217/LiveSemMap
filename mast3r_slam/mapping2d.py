@@ -31,6 +31,44 @@ def _get_font(px):
         return None
 
 
+def occupancy_vis(grid, traj_cell):
+    """占据栅格 -> 可视化 RGB (与导航 Web nav.html 底图同款视觉层次):
+    未知(暗) < 观测区(微亮) < 轨迹走廊带(亮) < 墙(白线)。
+    只显示与轨迹连通的 free(滤掉噪声点云的伪空闲碎片), 内部小洞填平
+    (多数格为真障碍的柱状岛保留), 墙只描走廊近旁 (~2.7m) 的真障碍。
+    grid: (G,G) uint8 0未知/1可通行/2障碍; traj_cell: (G,G) bool 轨迹格。
+    """
+    from scipy import ndimage as ndi
+
+    def _disk(r):
+        y, x = np.ogrid[-r:r + 1, -r:r + 1]
+        return (x * x + y * y) <= r * r
+
+    walk = (grid == 1)
+    lab, _ = ndi.label(walk | traj_cell)                    # 轨迹连通的观测区
+    keep = np.unique(lab[traj_cell])
+    fl = np.isin(lab, keep[keep > 0]) if keep.size else walk
+    fl = ndi.binary_closing(fl, _disk(1))
+    hole_lab, nh = ndi.label(~fl)
+    if nh:
+        sz = np.bincount(hole_lab.ravel(), minlength=nh + 1)
+        obs = np.bincount(hole_lab[grid == 2].ravel(), minlength=nh + 1)
+        edge = np.unique(np.concatenate(
+            [hole_lab[0], hole_lab[-1], hole_lab[:, 0], hole_lab[:, -1]]))
+        small = (sz <= 60) & (obs * 2 < sz)
+        small[edge] = False
+        fl |= small[hole_lab]
+    corr = ndi.binary_dilation(traj_cell, _disk(3)) & ~(~fl & (grid == 2))
+    wall = (grid == 2) & ~fl & ndi.binary_dilation(fl, np.ones((3, 3), bool)) \
+        & ndi.binary_dilation(traj_cell, _disk(9))
+
+    occ = np.full((*grid.shape, 3), (0.051, 0.067, 0.102), np.float32)  # 未知
+    occ[fl] = (0.118, 0.145, 0.208)                                     # 观测区(微亮)
+    occ[corr] = (0.290, 0.345, 0.447)                                   # 走廊带(亮)
+    occ[wall] = (0.796, 0.855, 0.941)                                   # 墙(白)
+    return occ
+
+
 def rasterize_map(P, C, centers, G=340):
     """点云 -> (bev, occ_vis, grid, meta)。
 
@@ -99,9 +137,24 @@ def rasterize_map(P, C, centers, G=340):
     grid[free] = 1
     grid[blocked] = 2
 
-    occ = np.full((G, G, 3), 0.20, np.float32)              # 未知=灰
-    occ[free] = np.array([0.82, 0.82, 0.80], np.float32)    # 空闲=亮
-    occ[blocked] = np.array([0.10, 0.11, 0.14], np.float32)  # 障碍=暗
+    # 占据可视化: 与导航 Web(nav.html 底图) 同款视觉层次 (grid 导航数据不变)
+    traj_cell = np.zeros((G, G), bool)
+    if len(centers):
+        tga, tgb = to_grid(centers[:, a], centers[:, b])
+        tin = (tga >= 0) & (tga < G) & (tgb >= 0) & (tgb < G)
+        jump = max(3, int(round(3.0 / (2 * half / G))))     # ~3m: 回环/重定位跳变不连线
+        for k in range(len(tga)):
+            if not tin[k]:
+                continue
+            traj_cell[tgb[k], tga[k]] = True
+            if k and tin[k - 1]:
+                dr, dc = int(tgb[k] - tgb[k - 1]), int(tga[k] - tga[k - 1])
+                m = max(abs(dr), abs(dc))
+                if 0 < m <= jump:                           # 相邻 kf 连线(稀疏段不成珠)
+                    for s in range(1, m):
+                        traj_cell[tgb[k - 1] + round(dr * s / m),
+                                  tga[k - 1] + round(dc * s / m)] = True
+    occ = occupancy_vis(grid, traj_cell)
 
     # 叠相机轨迹(青) + 当前相机(品红)
     if len(centers) > 1:
