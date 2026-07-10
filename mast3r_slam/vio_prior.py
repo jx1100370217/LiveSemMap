@@ -37,6 +37,44 @@ class VIOPrior:
         self.hist = deque(maxlen=self.window)  # (mast3r中心, vio位置)
         self.kf_pos = None           # 上一个关键帧处的 VIO 位置/姿态 (强制建关键帧用)
         self.kf_rot = None
+        self.metric_samples = deque(maxlen=400)  # X_canon 网络尺度->米 的逐帧标定样本
+
+    def update_metric_scale(self, fid_k, fid_f, frame, min_base=0.15, min_pts=500):
+        """X_canon 度量尺度标定 (不经 GN 位姿链): 匹配点对 (Xf_i<->Xk_i, 各自相机系,
+        网络尺度) 满足 α·(Xk_i − R·Xf_i) ≈ t, 其中 (R,t)=VIO 帧间相对位姿(米制,
+        姿态已验证为相机系)。对每点解 α_i = (d_i·t)/(d_i·d_i), 取帧内中位为一个样本。
+        α = 网络单位 -> 米, 供保存产物时以米制摆放 X_canon (evaluate._vio_scale)。
+        GN 位姿链的 Sim3 尺度慢性缩水, 位移比法会被拉大数倍, 故必须用本方法。"""
+        pts = getattr(frame, "scale_pts", None)
+        if pts is None:
+            return
+        frame.scale_pts = None
+        q, t = self._rel(fid_k, fid_f)
+        if float(np.linalg.norm(t)) < min_base:  # 基线太短, 分母噪声占主导
+            return
+        Xf, Xk = (p.cpu().numpy().reshape(-1, 3).astype(np.float64) for p in pts)
+        if len(Xf) < min_pts:
+            return
+        if len(Xf) > 20000:  # 抽样限点数
+            sel = np.random.default_rng(0).choice(len(Xf), 20000, replace=False)
+            Xf, Xk = Xf[sel], Xk[sel]
+        R = Rotation.from_quat(q).as_matrix()
+        d = Xk - Xf @ R.T
+        dd = np.einsum("ij,ij->i", d, d)
+        ok = dd > 1e-4
+        if ok.sum() < min_pts:
+            return
+        alpha = (d[ok] @ t) / dd[ok]
+        alpha = alpha[(alpha > 0.2) & (alpha < 20.0)]  # 物理合理范围
+        if len(alpha) < min_pts:
+            return
+        self.metric_samples.append(float(np.median(alpha)))
+
+    def metric_scale(self):
+        """全程稳健的 X_canon->米 尺度 (None=样本不足)。"""
+        if len(self.metric_samples) < 5:
+            return None
+        return float(np.median(self.metric_samples))
 
     def _real_t(self, fid):
         idx = int(min(max(fid, 0) * self.subsample, len(self.real) - 1))

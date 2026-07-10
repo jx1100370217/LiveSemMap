@@ -69,6 +69,13 @@ class FrameTracker:
             print(f"Skipped frame {frame.frame_id}")
             return False, [], True
 
+        # 供 VIO 度量尺度标定: 当前帧与关键帧的相机系匹配点对 (网络米制尺度)。
+        # 配合 VIO 帧间米制平移可解出 X_canon 网络尺度 -> 真实米的比例
+        # (vio_prior.update_metric_scale)。GN 位姿链的 Sim3 尺度会慢性缩水
+        # (实测位移比被拉大 2~11 倍), 故尺度不能从位姿估, 只能从点对+VIO 基线估。
+        m = valid_opt.flatten()
+        frame.scale_pts = (Xf[m].detach(), Xk[m].detach())
+
         try:
             # Track
             if not use_calib:

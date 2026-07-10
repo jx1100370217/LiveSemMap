@@ -35,4 +35,4 @@ def run_dir(cfg):
 
 def seq_name(cfg):
     """序列名 = 数据集目录名 (与 evaluate.prepare_savedir 的 stem 规则一致)。"""
-    return pathlib.Path(cfg.get("dataset", "datasets/insight9")).stem
+    return pathlib.Path(cfg.get("dataset", "datasets/cfds_floor28")).stem

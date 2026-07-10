@@ -19,7 +19,8 @@
 
 ## 快速开始
 
-在 `nav_config.yaml` 里配置一次数据集（内置 insight9 / Mapping_C8 两组配置），然后：
+在 `nav_config.yaml` 里配置一次数据集（内置 cfds_floor28 / cfds_floor1 / Mapping_C8 三组配置；
+insight9 新数据用 `setup/prep_insight9.py` 前处理），然后：
 
 ```bash
 python main.py                 # 1. 增量语义建图 (随时 Ctrl-C 中断, 产物完整)

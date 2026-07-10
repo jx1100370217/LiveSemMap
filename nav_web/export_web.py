@@ -9,7 +9,7 @@
   data.js               window.NAVDATA 单文件几何数据 (参考 VGP-Nav 设计)
   thumbs/kf{i}.jpg      关键帧缩略图 (从数据集原图生成, 360px 宽)
 
-用法: python nav_web/export_web.py --run logs/semantic_v1 --seq insight9 --dataset datasets/insight9
+用法: python nav_web/export_web.py --run logs/cfds_floor28_run --seq cfds_floor28 --dataset datasets/cfds_floor28
 """
 import argparse
 import json
@@ -27,9 +27,9 @@ from mast3r_slam.run_config import load_run_config, run_dir, seq_name  # noqa: E
 def main():
     rc = load_run_config()  # 默认值取自 nav_config.yaml, CLI 参数优先
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", default=str(run_dir(rc)), help="运行产物目录, 如 logs/insight9_run")
-    ap.add_argument("--seq", default=seq_name(rc), help="序列名, 如 insight9")
-    ap.add_argument("--dataset", default=rc.get("dataset", "datasets/insight9"),
+    ap.add_argument("--run", default=str(run_dir(rc)), help="运行产物目录, 如 logs/cfds_floor28_run")
+    ap.add_argument("--seq", default=seq_name(rc), help="序列名, 如 cfds_floor28")
+    ap.add_argument("--dataset", default=rc.get("dataset", "datasets/cfds_floor28"),
                     help="数据集目录(取原图做缩略图)")
     ap.add_argument("--thumb-width", type=int, default=360)
     args = ap.parse_args()
@@ -77,9 +77,31 @@ def main():
         kf_ann[int(k)] = {"cat": v["category"], "name": v.get("name", ""),
                           "conf": round(v.get("confidence", 0), 2)}
 
+    # 关键帧采集朝向 (地图像素系单位向量): VIO 姿态的相机 z 轴(前向)投影到 BEV 平面。
+    # 供 FPV 选帧做方向过滤 —— 来回走过的走廊上只选与行进方向同向拍摄的帧, 消除"倒走感"。
+    # 纯 RGB 数据集(无 vio.txt)不输出 dir, 前端自动退回纯距离选帧。
+    kf_dir = [None] * len(frame_ids)
+    vio_path, ts_path = ds / "vio.txt", ds / "timestamps.txt"
+    if vio_path.exists() and ts_path.exists():
+        from scipy.spatial.transform import Rotation
+        vio = np.loadtxt(vio_path)
+        ts = np.loadtxt(ts_path)
+        for i, fid in enumerate(frame_ids):
+            t = ts[min(int(fid), len(ts) - 1), 1]
+            j = int(np.clip(np.searchsorted(vio[:, 0], t), 1, len(vio) - 1))
+            if abs(vio[j - 1, 0] - t) < abs(vio[j, 0] - t):
+                j -= 1
+            fwd = Rotation.from_quat(vio[j, 4:8]).as_matrix()[:, 2]  # 相机光学系 z=前
+            v = np.array([fwd[a], -fwd[b]])  # 与 to_px 同一像素系 (屏幕 y 向下)
+            nv = np.linalg.norm(v)
+            if nv > 1e-6:
+                kf_dir[i] = [round(float(v[0] / nv), 3), round(float(v[1] / nv), 3)]
+        n_dir = sum(1 for d in kf_dir if d)
+        print(f"[export_web] 关键帧朝向 {n_dir}/{len(frame_ids)} (FPV 方向过滤)")
+
     # 缩略图: 从数据集原图按 frame_id 取。frame_id 是数据集内索引(RGBFiles 按
     # natsorted 顺序编号), 直接对 natsorted 文件列表按索引取, 兼容任意命名格式
-    # (insight9 的 000123.png / Mapping_C8 的 frame_00123.png)。
+    # (cfds_floor28 的 000123.png / Mapping_C8 的 frame_00123.png)。
     from natsort import natsorted
     all_pngs = natsorted(ds.glob("*.png"))
     n_thumb = 0
@@ -130,8 +152,9 @@ def main():
         "G": G,
         "m_per_px": round(m_per_px, 5),
         "grid": grid_rows,
-        "kf": [{"px": [round(float(x), 1), round(float(y), 1)], "fid": int(f)}
-               for (x, y), f in zip(kf_px, frame_ids)],
+        "kf": [{"px": [round(float(x), 1), round(float(y), 1)], "fid": int(f),
+                **({"dir": d} if d else {})}
+               for (x, y), f, d in zip(kf_px, frame_ids, kf_dir)],
         "kf_ann": kf_ann,
         "nodes": nodes,
         "categories": {k: {"zh": v[0],

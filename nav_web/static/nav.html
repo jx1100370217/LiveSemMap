@@ -370,7 +370,17 @@ function toast(s){ const t=document.getElementById('toast');
   t.textContent=s; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2600); }
 const fmtM = px=> isMetric? (px*MPP).toFixed(1)+' m' : (px*MPP).toFixed(1)+' u';
 
-function nearestKF(x,y){ let bi=0,bd=1e18;
+function nearestKF(x,y,hx,hy){
+  // (hx,hy)=期望观察朝向(单位向量,可选): 只在拍摄朝向(kf.dir,由 VIO 姿态导出)与之
+  // 夹角<~70°的关键帧里选, 消除来回走过的走廊上选中反向帧造成的"倒走感";
+  // 无同向帧(或数据集无朝向)再退回纯距离最近。
+  if(hx!==undefined){ let bi=-1,bd=1e18;
+    for(let i=0;i<D.kf.length;i++){ const K=D.kf[i];
+      if(!K.dir || K.dir[0]*hx+K.dir[1]*hy<0.34) continue;
+      const dx=K.px[0]-x, dy=K.px[1]-y, d=dx*dx+dy*dy;
+      if(d<bd){bd=d;bi=i;} }
+    if(bi>=0) return bi; }
+  let bi=0,bd=1e18;
   for(let i=0;i<D.kf.length;i++){ const dx=D.kf[i].px[0]-x, dy=D.kf[i].px[1]-y, d=dx*dx+dy*dy;
     if(d<bd){bd=d;bi=i;} } return bi; }
 function nearestNode(x,y,maxPx){ let bi=-1,bd=(maxPx||18)**2;
@@ -402,12 +412,12 @@ function plan(){ path=null; pathLen=0; robot=null; stopAnim();
   document.getElementById('tLen').textContent=fmtM(pathLen);
   document.getElementById('tEta').textContent=isMetric? (pathLen*MPP/speed).toFixed(0)+' s':'-';
   document.getElementById('btnGo').disabled=false;
-  robot={t:0,pos:[...p[0]],dir:0}; updateFPV(); staticDirty=true; }
+  robot={t:0,pos:[...p[0]],dir:samplePath(0)[1]}; updateFPV(); staticDirty=true; }
 
 // ---- 导航动画 ----
 function stopAnim(){ if(anim){cancelAnimationFrame(anim);anim=null;} }
 function startNav(){ if(!path) return; stopAnim();
-  robot={t:0,pos:[...path[0]],dir:0};
+  robot={t:0,pos:[...path[0]],dir:samplePath(0)[1]};
   document.getElementById('modeTip').textContent='导航中';
   let last=performance.now();
   const step=(now)=>{
@@ -443,7 +453,9 @@ function updateTele(){ if(!robot||!path) return;
 let fpvKf=-1;
 function updateFPV(){ const p=robot? robot.pos : (start? [start.x,start.y]:null);
   if(!p) return;
-  const k=nearestKF(p[0],p[1]);
+  // 导航中按行进方向(robot.dir=路径切向,像素系)过滤同向拍摄的关键帧
+  const k=robot? nearestKF(p[0],p[1],Math.cos(robot.dir),Math.sin(robot.dir))
+               : nearestKF(p[0],p[1]);
   if(k!==fpvKf){ fpvKf=k;
     document.getElementById('fpv').src=`/thumbs/kf${k}.jpg`;
     document.getElementById('fpvIdx').textContent=`kf ${k} / frame ${D.kf[k].fid}`;

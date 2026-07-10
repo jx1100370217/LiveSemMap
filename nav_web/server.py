@@ -5,7 +5,7 @@
 - POST /api/nl_query    自然语言 -> 语义节点/关键帧 (调 L40 vLLM, 与建图共用同一服务)
 - POST /api/locate_image 上传观察图像 -> SelaVPR 描述子 -> 最近关键帧 (VPR 重定位)
 
-用法: python nav_web/server.py --run logs/semantic_v1 --seq insight9 [--port 8080]
+用法: python nav_web/server.py --run logs/cfds_floor28_run --seq cfds_floor28 [--port 8080]
 """
 import argparse
 import base64
@@ -97,7 +97,7 @@ def nl_query():
             "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {"type": "json_schema",
                                 "json_schema": {"name": "match", "schema": schema}},
-        }, timeout=30)
+        }, timeout=30, proxies={"http": None, "https": None})  # 内网 vLLM 不走代理
         r.raise_for_status()
         out = json.loads(r.json()["choices"][0]["message"]["content"])
     except Exception as e:

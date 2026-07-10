@@ -187,11 +187,11 @@ if __name__ == "__main__":
     rc = load_run_config()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default=rc.get("dataset", "datasets/insight9"))
-    parser.add_argument("--config", default=rc.get("config", "config/insight9.yaml"))
+    parser.add_argument("--dataset", default=rc.get("dataset", "datasets/cfds_floor28"))
+    parser.add_argument("--config", default=rc.get("config", "config/cfds_floor28.yaml"))
     parser.add_argument("--save-as", default=rc.get("save_as", "default"))
     parser.add_argument("--no-viz", default=False)
-    parser.add_argument("--calib", default=rc.get("calib", "config/intrinsics_insight9.yaml"))
+    parser.add_argument("--calib", default=rc.get("calib", ""))
     parser.add_argument("--vio", default=rc.get("vio", ""),
                         help="方案B: VIO 度量轨迹(vio.txt, 同目录需 timestamps.txt), 给跟踪做运动补偿位姿先验; "
                              "不给=纯RGB(行为不变)")
@@ -239,18 +239,25 @@ if __name__ == "__main__":
         print(f"[方案B] 已启用 VIO 运动补偿位姿先验: {args.vio}")
 
     # VIO 强制建关键帧会更密, 需更大缓冲; 纯RGB 保持默认 512 不变
-    keyframes = SharedKeyframes(manager, h, w, buffer=(800 if args.vio else 512))
+    # (cfds_floor1 里程 269m, 0.4m/kf 强制+旋转触发估 ~900 kf, 800 会越界崩)
+    keyframes = SharedKeyframes(manager, h, w, buffer=(1200 if args.vio else 512))
     states = SharedStates(manager, h, w)
 
-    # 语义关键帧标注: 关键帧图像异步送 L40 vLLM 打语义标签, 结果进共享 dict
+    # 语义关键帧标注: 每个关键帧的 4 张环视图 (datasets/<name>/surround/) 异步送
+    # L40 vLLM 打语义标签, 结果进共享 dict
     # (viewer 读它画 BEV 语义节点; 退出时聚合保存 semantic.json)
     semantic_ann = manager.dict()
     annotator = None
     if args.semantic_api:
-        from mast3r_slam.semantic import SemanticAnnotator
-        annotator = SemanticAnnotator(args.semantic_api, semantic_ann,
-                                      model=args.semantic_model)
-        print(f"[semantic] 语义标注已启用: {args.semantic_api} ({args.semantic_model})")
+        surround_dir = pathlib.Path(args.dataset) / "surround"
+        if surround_dir.is_dir():
+            from mast3r_slam.semantic import SemanticAnnotator
+            annotator = SemanticAnnotator(args.semantic_api, semantic_ann, surround_dir,
+                                          model=args.semantic_model)
+            print(f"[semantic] 语义标注已启用: {args.semantic_api} "
+                  f"({args.semantic_model}, 环视图 {surround_dir})")
+        else:
+            print(f"[semantic] 数据集无环视图目录 {surround_dir}, 语义标注关闭")
 
     if not args.no_viz:
         viz = mp.Process(
@@ -324,6 +331,7 @@ if __name__ == "__main__":
 
     i = 0
     fps_timer = time.time()
+    reloc_streak = 0   # RELOC 连续未命中帧数 (方案B: 达阈值用 VIO 位姿续接)
 
     frames = []
 
@@ -401,11 +409,16 @@ if __name__ == "__main__":
             continue
 
         if mode == Mode.TRACKING:
+            reloc_streak = 0
             add_new_kf, match_info, try_reloc = tracker.track(frame)
             if vio_prior is not None:  # 方案B
                 vio_prior.update(i, frame.T_WC)  # 更新 MASt3R<->VIO 尺度
-                if not try_reloc and vio_prior.moved_enough(i):
-                    add_new_kf = True  # VIO 运动够大 -> 趁重叠还够强制建关键帧, 防快速运动跟丢
+                if not try_reloc:
+                    # X_canon 度量尺度标定: 匹配点对(track 存于 frame) + VIO 米制基线
+                    kf_fid = int(keyframes.dataset_idx[len(keyframes) - 1])
+                    vio_prior.update_metric_scale(kf_fid, i, frame)
+                    if vio_prior.moved_enough(i):
+                        add_new_kf = True  # VIO 运动够大 -> 趁重叠还够强制建关键帧, 防快速运动跟丢
             if try_reloc:
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
@@ -413,6 +426,24 @@ if __name__ == "__main__":
         elif mode == Mode.RELOC:
             X, C = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
+            reloc_streak += 1
+            if vio_prior is not None and reloc_streak >= 5:
+                # 方案B 续接: 检索重定位连续多帧不中 = 首次到达的新区域(库里无相似帧,
+                # 如无纹理白墙转角处跟丢后), 原版会把余下全程丢在 RELOC 里。此时用
+                # VIO 外推位姿(frame.T_WC 即 predict 链, 在线尺度已收敛)把当前帧
+                # (上面已 mono 推理)作为新关键帧恢复 TRACKING。瞬时遮挡/回访场景
+                # 仍走前 5 帧的检索重定位, 行为与原版一致。
+                print(f"[方案B] RELOC 连续 {reloc_streak} 帧未命中, "
+                      f"VIO 位姿续接重启跟踪 (帧 {i})")
+                keyframes.append(frame)
+                vio_prior.note_keyframe(i)
+                states.queue_global_optimization(len(keyframes) - 1)
+                tracker.reset_idx_f2k()
+                states.set_mode(Mode.TRACKING)
+                states.set_frame(frame)
+                reloc_streak = 0
+                i += 1
+                continue
             states.set_frame(frame)
             states.queue_reloc()
             # In single threaded mode, make sure relocalization happen for every frame

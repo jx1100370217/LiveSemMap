@@ -1,0 +1,6 @@
+inherit: "config/base.yaml"
+# cfds_floor1 (insight9 front_1 全量 ~6.3Hz, 无相机内参 -> 无标定模式)。
+# 全量帧建图(含静止段):
+#   python main.py --vio datasets/cfds_floor1/vio.txt
+dataset:
+  subsample: 1

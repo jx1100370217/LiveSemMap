@@ -90,6 +90,23 @@ def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
     save_ply(savedir / filename, pointclouds, colors)
 
 
+def _vio_scale(mast_c, vio_p, vio_prior):
+    """全局尺度 s (X_canon 网络单位 -> 米)。
+
+    首选建图时在线标定的度量尺度 (vio_prior.update_metric_scale: 匹配点对+VIO
+    米制基线直接解出, 与 GN 位姿链无关)。位移比中位数仅作兜底 —— GN 的 Sim3
+    尺度慢性缩水会把位移比拉大数倍 (本数据实测 3.4~11 倍), 地图随之报废。"""
+    ms = None
+    if hasattr(vio_prior, "metric_scale"):
+        ms = vio_prior.metric_scale()
+    if ms is not None:
+        return ms
+    dm = np.linalg.norm(np.diff(mast_c, axis=0), axis=1)
+    dv = np.linalg.norm(np.diff(vio_p, axis=0), axis=1)
+    good = (dm > 1e-4) & (dv > 0.02) & np.isfinite(dm) & np.isfinite(dv)
+    return float(np.median(dv[good] / dm[good])) if good.any() else 1.0
+
+
 def save_reconstruction_vio(savedir, filename, keyframes, vio_prior, c_conf_threshold):
     """VIO 位姿重建 (治单目 Sim3 累积漂移): 每个关键帧的相机系点云用 **VIO 位姿** 摆放,
     而非漂移的 MASt3R 位姿 —— VIO 管全局轨迹(米制/无漂移), MASt3R 管局部几何。仅 --vio 时。"""
@@ -105,11 +122,7 @@ def save_reconstruction_vio(savedir, filename, keyframes, vio_prior, c_conf_thre
         vio_p.append(p)
         vio_R.append(R.as_matrix())
     mast_c, vio_p, vio_R = np.array(mast_c), np.array(vio_p), np.array(vio_R)
-    # 全局尺度 s (MASt3R单位->米): 相邻关键帧位移比的稳健中位数
-    dm = np.linalg.norm(np.diff(mast_c, axis=0), axis=1)
-    dv = np.linalg.norm(np.diff(vio_p, axis=0), axis=1)
-    good = (dm > 1e-4) & (dv > 0.02) & np.isfinite(dm) & np.isfinite(dv)
-    s = float(np.median(dv[good] / dm[good])) if good.any() else 1.0
+    s = _vio_scale(mast_c, vio_p, vio_prior)
     pts, cols = [], []
     for i in range(N):
         kf = keyframes[i]
@@ -165,10 +178,7 @@ def _kf_world_geometry(keyframes, vio_prior, c_conf_threshold, stride=6):
             vio_p.append(p)
             vio_R.append(R.as_matrix())
         mast_c, vio_p, vio_R = np.array(mast_c), np.array(vio_p), np.array(vio_R)
-        dm = np.linalg.norm(np.diff(mast_c, axis=0), axis=1)
-        dv = np.linalg.norm(np.diff(vio_p, axis=0), axis=1)
-        good = (dm > 1e-4) & (dv > 0.02) & np.isfinite(dm) & np.isfinite(dv)
-        s = float(np.median(dv[good] / dm[good])) if good.any() else 1.0
+        s = _vio_scale(mast_c, vio_p, vio_prior)
 
     pts, cols, kf_pos = [], [], []
     for i in range(N):
