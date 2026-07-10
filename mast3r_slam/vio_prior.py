@@ -97,6 +97,10 @@ class VIOPrior:
         t = np.clip(self._real_t(fid), self.vt[0], self.vt[-1])
         return self._pos(t), self.slerp([t])[0]
 
+    def position(self, fid):
+        """该数据集帧处的 VIO 位置 (米制, 世界系)。语义标注空间抽稀等度量用途。"""
+        return self._pose_at(fid)[0]
+
     def note_keyframe(self, fid):
         """记录新关键帧处的 VIO 位姿, 作为后续"移动够了没"的基准。"""
         self.kf_pos, self.kf_rot = self._pose_at(fid)

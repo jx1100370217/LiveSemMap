@@ -153,23 +153,19 @@ class SemanticAnnotator:
         self.submit(kf_idx, frame_id)
         return True
 
-    def catch_up(self, keyframes):
+    def catch_up(self, keyframes, pos_fn=None):
         """追赶式提交: 把 keyframes 容器里所有还没提交的关键帧补交
-        (统一覆盖 INIT/TRACKING/backend重定位 三种 append 来源), 按 min_dist 抽稀。"""
-        import lietorch
-
+        (统一覆盖 INIT/TRACKING/backend重定位 三种 append 来源)。
+        pos_fn(frame_id)->(3,) 米制位置(VIO), 供空间抽稀; None=不抽稀全提交。
+        (不可用 SLAM T_WC 当位置源: Sim3 尺度自由且在线漂移, cfds_floor1 实测
+        位姿量级从 ~10 漂到 1e20, 曾致前段过度抽稀 25%、中段 99% 全提交。)"""
         n = len(keyframes)
         for i in range(n):
             if i in self.submitted:
                 continue
             with keyframes.lock:
                 fid = int(keyframes.dataset_idx[i])
-                Tdata = keyframes.T_WC[i].clone() if self.min_dist > 0 else None
-            pos = None
-            if Tdata is not None:
-                # 相机中心取法与 evaluate.save_keyframe_poses 一致 (Sim3 矩阵平移)
-                pos = lietorch.Sim3(Tdata).matrix().reshape(4, 4)[:3, 3].cpu().numpy()
-            self.submit_thinned(i, fid, pos)
+            self.submit_thinned(i, fid, pos_fn(fid) if pos_fn is not None else None)
 
     def pending(self):
         return self.q.qsize()

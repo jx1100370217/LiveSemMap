@@ -197,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default=rc.get("dataset", "datasets/cfds_floor28"))
     parser.add_argument("--config", default=rc.get("config", "config/cfds_floor28.yaml"))
     parser.add_argument("--save-as", default=rc.get("save_as", "default"))
-    parser.add_argument("--no-viz", default=True)
+    parser.add_argument("--no-viz", default=False)
     parser.add_argument("--calib", default=rc.get("calib", ""))
     parser.add_argument("--vio", default=rc.get("vio", ""),
                         help="方案B: VIO 度量轨迹(vio.txt, 同目录需 timestamps.txt), 给跟踪做运动补偿位姿先验; "
@@ -210,8 +210,8 @@ if __name__ == "__main__":
     parser.add_argument("--semantic-model", default=rc.get("semantic_model", "qwen3.5-35b-a3b"))
     parser.add_argument("--semantic-thin", type=float,
                         default=rc.get("semantic_thin", 0.4),
-                        help="语义标注空间抽稀: 距上一提交关键帧位移<该值(米, 与建图同尺度)"
-                             "则跳过标注; 0=全部关键帧都标")
+                        help="语义标注空间抽稀: 距上一提交关键帧 VIO 位移<该值(米)则跳过标注; "
+                             "0=全部关键帧都标; 仅 --vio 时生效(纯 RGB 无米制位置, 不抽稀)")
     parser.add_argument("--no-vpr", action="store_true",
                         help="退出时跳过 SelaVPR 描述子提取(默认提取, 供导航重定位)")
 
@@ -489,8 +489,10 @@ if __name__ == "__main__":
                     vio_prior.note_keyframe(i)
                 states.queue_global_optimization(len(keyframes) - 1)
         # 语义标注追赶式提交: 覆盖 INIT/TRACKING/backend重定位 三种关键帧来源
+        # 抽稀位置源用 VIO 米制位姿 (SLAM T_WC 尺度自由不可当米用); 纯 RGB 不抽稀
         if annotator is not None:
-            annotator.catch_up(keyframes)
+            annotator.catch_up(keyframes,
+                               pos_fn=vio_prior.position if vio_prior is not None else None)
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:

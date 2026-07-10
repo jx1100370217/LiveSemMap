@@ -12,13 +12,15 @@ dataset: datasets/cfds_floor28
 config: config/cfds_floor28.yaml
 calib: ""                           # 新 insight9 数据无相机内参 -> 无标定模式
 vio: datasets/cfds_floor28/vio.txt  # VIO 度量轨迹; 纯 RGB 数据集置空 ""
+vio: ""
 save_as: cfds_floor28_run           # 产物目录 logs/<save_as>/
 
 # ---- 数据集: cfds_floor1 创富大厦1楼 (用时取消注释并注释掉上面一组) ----
 # dataset: datasets/cfds_floor1
 # config: config/cfds_floor1.yaml
 # calib: ""
-# vio: datasets/cfds_floor1/vio.txt
+# # vio: datasets/cfds_floor1/vio.txt
+# vio: ""
 # save_as: cfds_floor1_run
 
 # ---- 数据集: Mapping_C8 (纯 RGB) ----
@@ -31,6 +33,8 @@ save_as: cfds_floor28_run           # 产物目录 logs/<save_as>/
 # ---- 语义标注 (L40 vLLM) ----
 semantic_api: http://192.168.50.72:8299/v1   # 置空 "" 关闭语义标注
 semantic_model: qwen3.5-35b-a3b
+semantic_thin: 0.4   # 空间抽稀: 距上一提交关键帧 VIO 位移<该值(米)不标注; 0=全标;
+                     # 仅配置了 vio 时生效 (纯 RGB 无米制位置, 自动全标)
 
 # ---- 导航 Web ----
 web_port: 8080
