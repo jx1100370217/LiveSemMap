@@ -1,8 +1,8 @@
 """语义关键帧标注: 增量建图时对每个新关键帧异步调 VLM(L40 vLLM) 打语义标签,
 并把相邻同类标注聚合成"语义节点"(门口/电梯间/茶水间等), 供 BEV 高亮与自然语言导航用。
 
-- 输入为该帧的 4 张环视鱼眼图 (insight9 camera_1..4 ≈ 前/右/后/左), 由前处理放在
-  datasets/<name>/surround/{frame_id:06d}_{1..4}.jpg, 按 frame_id 从磁盘读取直接发 VLM;
+- 输入为该帧的前视高清图(_0) + 4 张环视鱼眼(_1.._4 ≈ 前/右/后/左), 由前处理放在
+  datasets/<name>/surround/{frame_id:06d}_{0..4}.jpg, 按 frame_id 从磁盘读取直接发 VLM;
 - 标注在主进程内的线程池执行(HTTP IO 密集, 不占 GPU/不阻塞 SLAM 主循环);
 - 结果写 mp.Manager().dict() {kf_idx: annotation}, viewer 进程可直接读;
 - 节点位置不在此处存死: 聚合时由调用方传入各关键帧当前位置(VIO 或 SLAM 位姿),
@@ -94,14 +94,24 @@ class SemanticAnnotator:
     """异步语义标注器: submit() 入队 -> 线程池按 frame_id 读 4 环视图调 vLLM -> 结果写共享 dict。"""
 
     def __init__(self, api_url, shared_ann, surround_dir,
-                 model="qwen3.5-35b-a3b", workers=8, timeout=60):
-        # workers=8 配合 vLLM --max-num-seqs 8; 4 图/请求比单图慢, 但 insight9 新数据
+                 model="qwen3.5-35b-a3b", workers=8, timeout=60, min_dist=0.4):
+        # workers=8 配合 vLLM --max-num-seqs 8; 多图/请求比单图慢, 但 insight9 新数据
         # 关键帧生成率低(帧间隔~2s), 标注可实时跟上建图。
         self.api_url = api_url.rstrip("/")
         self.model = model
         self.ann = shared_ann          # mp.Manager().dict: kf_idx -> annotation dict
         self.surround_dir = pathlib.Path(surround_dir)  # {frame_id:06d}_{1..4}.jpg
         self.timeout = timeout
+        # 空间抽稀: 距上一提交帧位移 < min_dist(米) 的关键帧不标注 (0=关闭)。
+        # VIO 0.4m/kf 建帧下 D=0.4m 约筛掉 1/3 帧; 实测(cfds_floor28, 559kf)
+        # 聚合节点除同门头类别变体外无损, D>=0.5 开始丢真节点 —— 勿轻易调大。
+        # max_gap: 停留保护 —— 位移不足但已连续跳过 >=max_gap 帧时强制标 1 帧。
+        # 驻足处常是地标(操作员停下看门头/等电梯), 纯距离抽稀会把停留段砍到
+        # 只剩进入帧, 单帧 VLM 波动即丢节点(实测丢过 2803电梯)。
+        self.min_dist = min_dist
+        self.max_gap = 5
+        self._last_pos = None          # 上一提交帧位置 (与 min_dist 同尺度)
+        self._last_idx = None          # 上一提交帧 kf_idx (停留保护计数)
         self.q = queue.Queue()
         self.submitted = set()         # 已提交过的 kf_idx (追赶式提交去重)
         self.fail_streak = 0
@@ -113,7 +123,9 @@ class SemanticAnnotator:
             t.start()
 
     def surround_paths(self, frame_id):
-        """该帧的语义图路径: _0=前视高清(读文字标识), _1.._4=环视鱼眼 (允许个别缺失)。"""
+        """该帧的语义图路径: _0=前视高清(读文字标识), _1.._4=环视鱼眼 (允许个别缺失)。
+        (实验过只发 _0/_2/_4 三图: 仅快 ~10%, 但帧级文字召回 93%->80%,
+        且只在前/后鱼眼出现的门头会整个丢失, 故保留 5 图。)"""
         paths = [self.surround_dir / f"{int(frame_id):06d}_{k}.jpg" for k in range(0, 5)]
         return [p for p in paths if p.exists()]
 
@@ -124,15 +136,40 @@ class SemanticAnnotator:
         self.submitted.add(kf_idx)
         self.q.put((kf_idx, int(frame_id)))
 
+    def submit_thinned(self, kf_idx, frame_id, pos):
+        """带空间抽稀的提交 (在线/离线共用入口): pos 为该帧位置, None=不抽稀。
+        跳过条件: 距上一提交帧位移 < min_dist 且连续跳过不足 max_gap 帧
+        (跳过帧记入 submitted, 不回捞)。返回是否实际提交。"""
+        if self.min_dist > 0 and pos is not None and np.isfinite(pos).all():
+            near = self._last_pos is not None and \
+                np.linalg.norm(pos - self._last_pos) < self.min_dist
+            stale = self._last_idx is not None and \
+                (kf_idx - self._last_idx) >= self.max_gap
+            if near and not stale:
+                self.submitted.add(kf_idx)
+                return False
+            self._last_pos = np.asarray(pos, np.float64)
+        self._last_idx = kf_idx
+        self.submit(kf_idx, frame_id)
+        return True
+
     def catch_up(self, keyframes):
         """追赶式提交: 把 keyframes 容器里所有还没提交的关键帧补交
-        (统一覆盖 INIT/TRACKING/backend重定位 三种 append 来源)。"""
+        (统一覆盖 INIT/TRACKING/backend重定位 三种 append 来源), 按 min_dist 抽稀。"""
+        import lietorch
+
         n = len(keyframes)
         for i in range(n):
-            if i not in self.submitted:
-                with keyframes.lock:
-                    fid = int(keyframes.dataset_idx[i])
-                self.submit(i, fid)
+            if i in self.submitted:
+                continue
+            with keyframes.lock:
+                fid = int(keyframes.dataset_idx[i])
+                Tdata = keyframes.T_WC[i].clone() if self.min_dist > 0 else None
+            pos = None
+            if Tdata is not None:
+                # 相机中心取法与 evaluate.save_keyframe_poses 一致 (Sim3 矩阵平移)
+                pos = lietorch.Sim3(Tdata).matrix().reshape(4, 4)[:3, 3].cpu().numpy()
+            self.submit_thinned(i, fid, pos)
 
     def pending(self):
         return self.q.qsize()
@@ -147,6 +184,8 @@ class SemanticAnnotator:
             pass
         self.submitted.clear()
         self.ann.clear()
+        self._last_pos = None
+        self._last_idx = None
 
     def drain(self, print_progress=True):
         """退出前排空标注队列(保证已建图的关键帧都拿到语义标注)。"""
@@ -188,13 +227,25 @@ class SemanticAnnotator:
 
     def _annotate(self, img_paths, retries=2):
         """img_paths: 该帧的环视 jpg 路径列表 (camera_1..4 顺序, 允许缺个别)。"""
+        import io
+
         import requests
+        from PIL import Image
 
         if not img_paths:
             return None
         content = []
         for p in img_paths:
-            b64 = base64.b64encode(p.read_bytes()).decode()
+            raw = p.read_bytes()
+            if not p.stem.endswith("_0"):
+                # 鱼眼缩半再发: 畸变大且不指望读文字, 1024x819 -> 512x410
+                # 每张 ~835 -> ~250 视觉 token; 前视 _0 保持原图用于读门牌/公司名
+                im = Image.open(io.BytesIO(raw))
+                im = im.resize((im.width // 2, im.height // 2), Image.BILINEAR)
+                buf = io.BytesIO()
+                im.convert("RGB").save(buf, "JPEG", quality=85)
+                raw = buf.getvalue()
+            b64 = base64.b64encode(raw).decode()
             content.append({"type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
         content.append({"type": "text", "text": PROMPT})

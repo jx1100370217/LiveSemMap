@@ -31,6 +31,8 @@ def main():
     ap.add_argument("--model", default=rc.get("semantic_model", "qwen3.5-35b-a3b"))
     ap.add_argument("--reuse", action="store_true",
                     help="复用现有 semantic.json 的逐帧标注, 只重跑节点聚合 (调聚合参数用)")
+    ap.add_argument("--thin-dist", type=float, default=0.4,
+                    help="空间抽稀: 距上一提交帧位移<该值(米)的关键帧跳过标注; 0=全量")
     args = ap.parse_args()
 
     run = pathlib.Path(args.run)
@@ -48,12 +50,16 @@ def main():
         assert surround.is_dir(), f"缺环视图目录 {surround}"
         print(f"[relabel] {len(frame_ids)} 个关键帧, 环视图 {surround}, VLM {args.api}")
         ann = {}
-        a = SemanticAnnotator(args.api, ann, surround, model=args.model)
+        a = SemanticAnnotator(args.api, ann, surround, model=args.model,
+                              min_dist=args.thin_dist)
+        n_sub = 0
         for i, fid in enumerate(frame_ids):
-            a.submit(i, fid)
+            n_sub += a.submit_thinned(i, fid, kf_pos[i])
+        print(f"[relabel] 空间抽稀(thin_dist={args.thin_dist}m): "
+              f"提交 {n_sub}/{len(frame_ids)} 帧")
         a.drain()
         assert not a.disabled, "VLM 服务连续失败, 已中止 (检查 L40 vLLM)"
-        print(f"[relabel] 标注完成 {len(ann)}/{len(frame_ids)}")
+        print(f"[relabel] 标注完成 {len(ann)}/{n_sub}")
 
     pos_by_kf = {i: kf_pos[i] for i in range(len(frame_ids))
                  if np.isfinite(kf_pos[i]).all()}

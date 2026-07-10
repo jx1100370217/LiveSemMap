@@ -201,6 +201,10 @@ if __name__ == "__main__":
                         default=rc.get("semantic_api", "http://192.168.50.72:8299/v1"),
                         help="语义标注 vLLM 服务地址; 空串=关闭语义标注")
     parser.add_argument("--semantic-model", default=rc.get("semantic_model", "qwen3.5-35b-a3b"))
+    parser.add_argument("--semantic-thin", type=float,
+                        default=rc.get("semantic_thin", 0.4),
+                        help="语义标注空间抽稀: 距上一提交关键帧位移<该值(米, 与建图同尺度)"
+                             "则跳过标注; 0=全部关键帧都标")
     parser.add_argument("--no-vpr", action="store_true",
                         help="退出时跳过 SelaVPR 描述子提取(默认提取, 供导航重定位)")
 
@@ -253,9 +257,11 @@ if __name__ == "__main__":
         if surround_dir.is_dir():
             from mast3r_slam.semantic import SemanticAnnotator
             annotator = SemanticAnnotator(args.semantic_api, semantic_ann, surround_dir,
-                                          model=args.semantic_model)
+                                          model=args.semantic_model,
+                                          min_dist=args.semantic_thin)
             print(f"[semantic] 语义标注已启用: {args.semantic_api} "
-                  f"({args.semantic_model}, 环视图 {surround_dir})")
+                  f"({args.semantic_model}, 环视图 {surround_dir}, "
+                  f"空间抽稀 {args.semantic_thin}m)")
         else:
             print(f"[semantic] 数据集无环视图目录 {surround_dir}, 语义标注关闭")
 
