@@ -288,7 +288,11 @@ class SharedKeyframes:
 
     def __setitem__(self, idx, value: Frame) -> None:
         with self.lock:
-            self.n_size.value = max(idx + 1, self.n_size.value)
+            if idx >= self.buffer:
+                # 越界必须在改 n_size 之前拦下: 曾因先置 n_size=1201 再写数据时
+                # 抛 IndexError, 其他进程按 len()=1201 读 buffer[1200] 连环崩
+                raise IndexError(
+                    f"关键帧缓冲已满 (buffer={self.buffer}), 无法写入 kf{idx}")
 
             # set the attributes
             self.dataset_idx[idx] = value.frame_id
@@ -304,11 +308,16 @@ class SharedKeyframes:
             self.N[idx] = value.N
             self.N_updates[idx] = value.N_updates
             self.is_dirty[idx] = True
+            self.n_size.value = max(idx + 1, self.n_size.value)  # 数据写全后才更新
             return idx
 
     def __len__(self):
         with self.lock:
             return self.n_size.value
+
+    def is_full(self):
+        with self.lock:
+            return self.n_size.value >= self.buffer
 
     def append(self, value: Frame):
         with self.lock:

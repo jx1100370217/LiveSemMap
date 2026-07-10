@@ -52,6 +52,13 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         )
         kf_idx += retrieval_inds
         successful_loop_closure = False
+        if kf_idx and keyframes.is_full():
+            # 缓冲满则无法为重定位添加临时关键帧 —— 曾在出入口跟踪风暴中
+            # (78 帧新建 138 kf)撑破 buffer=1200, append 越界连环崩掉后端+主进程
+            if not getattr(relocalization, "_full_warned", False):
+                relocalization._full_warned = True
+                print(f"[backend] 关键帧缓冲已满({keyframes.buffer}), 后续重定位跳过")
+            return False
         if kf_idx:
             keyframes.append(frame)
             n_kf = len(keyframes)
@@ -190,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default=rc.get("dataset", "datasets/cfds_floor28"))
     parser.add_argument("--config", default=rc.get("config", "config/cfds_floor28.yaml"))
     parser.add_argument("--save-as", default=rc.get("save_as", "default"))
-    parser.add_argument("--no-viz", default=False)
+    parser.add_argument("--no-viz", default=True)
     parser.add_argument("--calib", default=rc.get("calib", ""))
     parser.add_argument("--vio", default=rc.get("vio", ""),
                         help="方案B: VIO 度量轨迹(vio.txt, 同目录需 timestamps.txt), 给跟踪做运动补偿位姿先验; "
@@ -338,6 +345,7 @@ if __name__ == "__main__":
     i = 0
     fps_timer = time.time()
     reloc_streak = 0   # RELOC 连续未命中帧数 (方案B: 达阈值用 VIO 位姿续接)
+    kf_full_warned = False   # 关键帧缓冲满的一次性警告
 
     frames = []
 
@@ -367,6 +375,7 @@ if __name__ == "__main__":
                 inc_saver.reset()
             i = 0
             fps_timer = time.time()
+            kf_full_warned = False
             next_snap = args.snapshot_every  # 快照序号也重新开始
             print("[重新建图] 已清空, 从第 0 帧重来")
             continue
@@ -441,9 +450,15 @@ if __name__ == "__main__":
                 # 仍走前 5 帧的检索重定位, 行为与原版一致。
                 print(f"[方案B] RELOC 连续 {reloc_streak} 帧未命中, "
                       f"VIO 位姿续接重启跟踪 (帧 {i})")
-                keyframes.append(frame)
-                vio_prior.note_keyframe(i)
-                states.queue_global_optimization(len(keyframes) - 1)
+                if keyframes.is_full():   # 缓冲满: 不新增关键帧, 仅恢复跟踪
+                    if not kf_full_warned:
+                        kf_full_warned = True
+                        print(f"[警告] 关键帧缓冲已满({keyframes.buffer}), 不再新增"
+                              f"关键帧 (跟踪/VIO 轨迹继续, 地图不再扩展)")
+                else:
+                    keyframes.append(frame)
+                    vio_prior.note_keyframe(i)
+                    states.queue_global_optimization(len(keyframes) - 1)
                 tracker.reset_idx_f2k()
                 states.set_mode(Mode.TRACKING)
                 states.set_frame(frame)
@@ -463,10 +478,16 @@ if __name__ == "__main__":
             raise Exception("Invalid mode")
 
         if add_new_kf:
-            keyframes.append(frame)
-            if vio_prior is not None:
-                vio_prior.note_keyframe(i)
-            states.queue_global_optimization(len(keyframes) - 1)
+            if keyframes.is_full():   # 缓冲满: 优雅降级, 不再新增关键帧
+                if not kf_full_warned:
+                    kf_full_warned = True
+                    print(f"[警告] 关键帧缓冲已满({keyframes.buffer}), 不再新增"
+                          f"关键帧 (跟踪/VIO 轨迹继续, 地图不再扩展)")
+            else:
+                keyframes.append(frame)
+                if vio_prior is not None:
+                    vio_prior.note_keyframe(i)
+                states.queue_global_optimization(len(keyframes) - 1)
         # 语义标注追赶式提交: 覆盖 INIT/TRACKING/backend重定位 三种关键帧来源
         if annotator is not None:
             annotator.catch_up(keyframes)
