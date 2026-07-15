@@ -214,6 +214,9 @@ if __name__ == "__main__":
                              "0=全部关键帧都标; 仅 --vio 时生效(纯 RGB 无米制位置, 不抽稀)")
     parser.add_argument("--no-vpr", action="store_true",
                         help="退出时跳过 SelaVPR 描述子提取(默认提取, 供导航重定位)")
+    parser.add_argument("--no-lotis", action="store_true",
+                        help="退出时跳过 LoTIS 记忆分段(默认生成, 供导航打点); "
+                             "按语义节点边切段 + junction 拐弯段, 存 _lotis_seg.json/_lotis_traj.pkl")
 
     args = parser.parse_args()
 
@@ -536,7 +539,7 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 print(f"[save {idx}/{total}] {name} 失败, 跳过并继续保存其余产物", flush=True)
 
-        n_steps = 7
+        n_steps = 8
         print(f"[save] 开始保存全部地图产物到 {save_dir} (共 {n_steps} 步, "
               f"约 1-3 分钟, 请勿关闭终端; 此时按 Ctrl-C 会丢失未保存产物)", flush=True)
         _save_step(1, n_steps, "轨迹", lambda: eval.save_traj(
@@ -562,6 +565,16 @@ if __name__ == "__main__":
         if not args.no_vpr:
             _save_step(7, n_steps, "SelaVPR 描述子", lambda: eval.save_vpr_descriptors(
                 save_dir, seq_name, keyframes))
+        else:
+            print(f"[save 7/{n_steps}] --no-vpr, 跳过 SelaVPR 描述子", flush=True)
+        # LoTIS 记忆分段: 按语义节点边切段(+junction 拐弯段), 逐段预编码, 供导航打点。
+        # 依赖 step 6 的 {seq}_semantic.json; 段帧=原始帧, 图取自 datasets/*.png(kf->原始帧映射读 occupancy)。
+        if not args.no_lotis:
+            from mast3r_slam import lotis_memory
+            _save_step(8, n_steps, "LoTIS 记忆分段", lambda: lotis_memory.save_lotis_memory(
+                save_dir, seq_name, args.dataset))
+        else:
+            print(f"[save 8/{n_steps}] --no-lotis, 跳过 LoTIS 记忆分段", flush=True)
         print(f"[save] 产物保存流程结束 -> {save_dir}", flush=True)
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")

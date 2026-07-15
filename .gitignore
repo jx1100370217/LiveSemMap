@@ -141,3 +141,13 @@ screen.yaml
 # 本机搭建产物 (5090/gcc-14 编译器 shim)
 .gcc14/
 notebooks/*
+
+# 模型权重 (超过 GitHub 100MB 单文件上限, 不入库)
+pretrained/
+*.pth
+*.safetensors
+
+# 运行日志与备份
+*.out
+*.bak
+*.bak_*

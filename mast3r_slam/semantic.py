@@ -9,6 +9,7 @@
   全局优化/尺度对齐后节点位置自动跟随。
 """
 import base64
+import difflib
 import json
 import pathlib
 import queue
@@ -295,7 +296,21 @@ def _sig_compatible(sigs_a, sigs_b):
     return not sigs_a or not sigs_b or bool(sigs_a & sigs_b)
 
 
-def aggregate_nodes(ann_by_kf, pos_by_kf, merge_dist=2.5, min_conf=0.5):
+def _name_sim(x, y):
+    """节点名相似度 [0,1]: 序列匹配比 与 字符二元组 Jaccard 取大。
+    兼顾 OCR 变体('创享大厦'/'创意大厦')与词序差异('酒店入口'/'酒店出入口'),
+    而语义不同的名('酒店大堂'/'前台接待区')得分低 —— 用于保守去重的语义门槛。"""
+    if not x or not y:
+        return 0.0
+    seq = difflib.SequenceMatcher(None, x, y).ratio()
+    ba = {x[i:i + 2] for i in range(len(x) - 1)} or {x}
+    bb = {y[i:i + 2] for i in range(len(y) - 1)} or {y}
+    jac = len(ba & bb) / len(ba | bb) if (ba | bb) else 0.0
+    return max(seq, jac)
+
+
+def aggregate_nodes(ann_by_kf, pos_by_kf, merge_dist=2.5, min_conf=0.5,
+                    dedup_dist=2.0, name_sim_thresh=0.8):
     """把逐关键帧标注聚合成语义节点列表。
 
     ann_by_kf: {kf_idx: annotation dict}   (可直接传 Manager.dict 的快照)
@@ -303,7 +318,13 @@ def aggregate_nodes(ann_by_kf, pos_by_kf, merge_dist=2.5, min_conf=0.5):
     规则: 按 kf_idx 序把地标标注分段(同类别、相邻空间距离<merge_dist 且文字标识
           兼容才连成段 —— A电梯/B电梯这类编号不同的近邻地标不合并);
           段内代表优先取"读到文字标识"里置信度最高者(节点名尽量用真实门牌/公司名);
-          再跨段做同类近距且标识兼容的合并(走回头路去重)。
+          再跨段做同类近距且标识兼容的合并(走回头路去重);
+          最后一步「保守名字去重」把上游 signage 噪声(同一门口读出不同外卖柜/门牌字
+          样、或同名 OCR 变体)拆出的重复节点按 名字相似度 合回 —— 同类 + 质心距 <
+          dedup_dist + 名字相似 >= name_sim_thresh 才并, 语义不同的近邻(酒店大堂 vs
+          前台)名字不像故保留, 新语义不丢。
+    节点 position 取「离质心最近的成员关键帧位置」(medoid): 关键帧必在轨迹上,
+          不会像质心那样因走回头路/回环漂移落进墙里/不可通行区。
     返回: [{category, name, description, confidence, kf_indices, rep_kf, position}]
     """
     items = []
@@ -354,12 +375,59 @@ def aggregate_nodes(ann_by_kf, pos_by_kf, merge_dist=2.5, min_conf=0.5):
         else:
             merged.append(s)
 
-    # 3) 每组选代表: 读到文字标识的优先 (节点名用真实门牌/公司名), 再比置信度
+    # 2.5) 保守名字去重: 同类 + medoid距 < dedup_dist + 名字相似 >= name_sim_thresh 的组合并。
+    #      纯加合并(不拆已有组), 修 signage 噪声把同一地标拆成多个的情况。
+    #      距离用 medoid(离质心最近的成员帧, 即最终显示位置)而非质心 —— 组内成员若因
+    #      上游 signage 无限距合并横跨多处, 质心会落到中间空地, 使实际近在咫尺(实测 0.6m)
+    #      的同名组被误判成十几米外不合并; medoid 是真实轨迹点, 与显示一致、不受横跨影响。
+    def _rep_name(m):
+        sc = [(bool(_sigs(a)), a.get("confidence", 0)) for a in m["anns"]]
+        return m["anns"][int(max(range(len(sc)), key=lambda i: sc[i]))].get("name", "")
+
+    def _medoid(m):
+        P = np.asarray(m["positions"], np.float64)
+        return P[int(np.argmin(np.linalg.norm(P - P.mean(axis=0), axis=1)))]
+    meds = [_medoid(m) for m in merged]
+    names = [_rep_name(m) for m in merged]
+    parent = list(range(len(merged)))
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for i in range(len(merged)):
+        for j in range(i + 1, len(merged)):
+            if merged[i]["category"] != merged[j]["category"]:
+                continue
+            if np.linalg.norm(meds[i] - meds[j]) >= dedup_dist:
+                continue
+            if _name_sim(names[i], names[j]) < name_sim_thresh:
+                continue
+            parent[_find(i)] = _find(j)
+    groups = {}
+    for i in range(len(merged)):
+        groups.setdefault(_find(i), []).append(i)
+    deduped = []
+    for idxs in groups.values():
+        base = merged[idxs[0]]
+        for k in idxs[1:]:
+            base["kf_indices"] += merged[k]["kf_indices"]
+            base["positions"] += merged[k]["positions"]
+            base["anns"] += merged[k]["anns"]
+            base["sigs"] |= merged[k]["sigs"]
+        deduped.append(base)
+    merged = deduped
+
+    # 3) 每组选代表: 读到文字标识的优先 (节点名用真实门牌/公司名), 再比置信度。
+    #    position 用 medoid(离质心最近的成员帧位置), rep_kf 仍用读字最清的帧(缩略图用)。
     nodes = []
     for m in merged:
         scores = [(bool(_sigs(a)), a.get("confidence", 0)) for a in m["anns"]]
         best = int(max(range(len(scores)), key=lambda i: scores[i]))
         rep = m["anns"][best]
+        pos = np.asarray(m["positions"], np.float64)
+        medoid = int(np.argmin(np.linalg.norm(pos - pos.mean(axis=0), axis=1)))
         nodes.append({
             "category": m["category"],
             "name": rep.get("name", ""),
@@ -367,6 +435,6 @@ def aggregate_nodes(ann_by_kf, pos_by_kf, merge_dist=2.5, min_conf=0.5):
             "confidence": float(rep.get("confidence", 0)),
             "kf_indices": [int(k) for k in m["kf_indices"]],
             "rep_kf": int(m["kf_indices"][best]),
-            "position": [float(x) for x in np.mean(m["positions"], axis=0)],
+            "position": [float(x) for x in pos[medoid]],
         })
     return nodes

@@ -58,6 +58,9 @@
   .btn.rst{border-color:rgba(255,42,109,.4);color:var(--mag);flex:0 0 auto;padding:9px 14px}
   .btn:disabled{opacity:.4;cursor:not-allowed;box-shadow:none}
   .row{display:flex;gap:8px;margin-bottom:9px;align-items:center}
+  .modeSw{gap:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;padding:0}
+  .modeSw .btn{border:0;border-radius:0;padding:8px 10px}
+  .modeSw .btn+.btn{border-left:1px solid var(--line)}
   .speed{font-size:11.5px;color:var(--dim);gap:8px}
   .speed input[type=range]{flex:1;accent-color:var(--cyan);height:4px}
   .prev2{display:flex;gap:10px;margin-bottom:10px}
@@ -77,6 +80,26 @@
     max-height:46vh;object-fit:contain;background:#0a1220}
   .fpvcap{font-size:11.5px;color:var(--dim);margin-top:6px;display:flex;justify-content:space-between}
   .fpvcap b{color:var(--amber)}
+  #fpvWrap{position:relative;line-height:0}
+  #fpvcv{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+  .lotisbar{display:flex;gap:6px;margin-top:7px;align-items:center}
+  .lotisbar select{flex:1;min-width:0;background:rgba(6,12,22,.8);border:1px solid var(--line);
+    border-radius:6px;color:var(--txt);font-family:inherit;font-size:11px;padding:6px 7px;outline:none}
+  .lotisbar button{background:none;border:1px solid var(--line);color:var(--dim);
+    border-radius:6px;font-size:11px;padding:6px 9px;cursor:pointer;font-family:inherit;white-space:nowrap}
+  .lotisbar button:hover{color:var(--cyan);border-color:var(--cyan)}
+  .lotismsg{font-size:10.5px;color:var(--dim);min-height:13px;margin-top:4px}
+  .lotismsg.ok{color:var(--green)} .lotismsg.err{color:var(--mag)}
+  #lotisSteps{display:flex;flex-direction:column;gap:3px;margin-top:5px}
+  .lstep{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--txt);
+    border:1px solid var(--line);border-radius:6px;padding:4px 7px;background:rgba(6,12,22,.4)}
+  .lstep span:first-child{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lstep .tag{color:#ff4fd8;font-size:9.5px;white-space:nowrap}
+  .lstep .tag.sc{color:#ff9a3c}
+  .lstep .tag.mn{color:#28d27f}
+  .lstep button{background:none;border:1px solid var(--line);color:var(--dim);
+    border-radius:5px;font-size:10px;padding:2px 7px;cursor:pointer;font-family:inherit}
+  .lstep button:hover{color:var(--cyan);border-color:var(--cyan)}
   .tele{display:grid;grid-template-columns:1fr 1fr;gap:7px}
   .tv{background:rgba(6,12,22,.5);border:1px solid var(--line);border-radius:7px;padding:7px 9px}
   .tv .k{font-size:10px;color:var(--dim);letter-spacing:.5px}
@@ -128,6 +151,10 @@
   <aside>
     <div class="sec nav">
       <h2>导航控制 <span class="r" id="modeTip">空闲</span></h2>
+      <div class="row modeSw">
+        <button class="btn on" id="btnModeAstar" title="A* 几何最短路 + 关键帧视觉观察">🗺 A* 导航</button>
+        <button class="btn" id="btnModeLotis" title="LoTIS 拓扑路线 + 逐帧打点">🎯 LoTIS 导航</button>
+      </div>
       <div class="prev2">
         <div class="pcard s"><div class="cap"><b>起点</b><span id="sName">未设置</span></div>
           <div class="ph" id="sPh">点选 / 语言 / 图像</div></div>
@@ -159,8 +186,14 @@
     </div>
     <div class="sec">
       <h2>视觉观察 <span class="r" id="fpvIdx">-</span></h2>
-      <img id="fpv" src="" alt="">
+      <div id="fpvWrap"><img id="fpv" src="" alt=""><canvas id="fpvcv"></canvas></div>
       <div class="fpvcap"><span id="fpvSem">-</span><b id="fpvDist"></b></div>
+      <div id="lotisPanel" style="display:none">
+        <div class="lotismsg" id="lotisMsg">规划 LoTIS 路线后, 观察帧自动打点</div>
+        <div class="lotisbar"><button id="btnLotisRoute">🧭 LoTIS 路线(起→终, 抄近路)</button></div>
+        <div class="lotismsg" id="lotisRouteMsg"></div>
+        <div id="lotisSteps"></div>
+      </div>
     </div>
     <div class="sec">
       <h2>遥测</h2>
@@ -337,7 +370,7 @@ function nodeEndpoint(kind,n){ let bi=n.rep_kf, bd=Infinity;
   n.kfs.forEach(k=>{ const d=Math.hypot(D.kf[k].px[0]-n.px[0], D.kf[k].px[1]-n.px[1]);
     if(d<bd){bd=d;bi=k;} });
   const kp=D.kf[bi].px;
-  setEndpoint(kind, kp[0], kp[1], n.name, bi); }
+  setEndpoint(kind, kp[0], kp[1], n.name, bi, n.id); }   // 节点 id 传给 setEndpoint 统一设 startNode/goalNode
 
 // ---- 视图/画布 ----
 const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
@@ -434,6 +467,7 @@ let path=null, pathLen=0;  // px 数组
 let robot=null;            // {t: 沿路径累计px, pos:[x,y], dir}
 let anim=null, speed=1.2;
 let selNode=-1, hoverNode=-1;
+let navMode='astar';       // astar | lotis  —— 导航模式开关, 两种只显示一种
 
 function toast(s){ const t=document.getElementById('toast');
   t.textContent=s; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2600); }
@@ -456,11 +490,12 @@ function nearestNode(x,y,maxPx){ let bi=-1,bd=(maxPx||18)**2;
   for(let i=0;i<D.nodes.length;i++){ const dx=D.nodes[i].px[0]-x,dy=D.nodes[i].px[1]-y,d=dx*dx+dy*dy;
     if(d<bd){bd=d;bi=i;} } return bi; }
 
-function setEndpoint(kind, px, py, label, kfIdx){
+function setEndpoint(kind, px, py, label, kfIdx, nodeId){
   const s=snap(px,py);
   const kf = kfIdx!=null? kfIdx : nearestKF(s.x,s.y);
   const o={...s,label:label||'地图点',kf};
-  if(kind==='S') start=o; else goal=o;
+  const nn = (nodeId!=null)? nodeId : nearestNode(s.x,s.y,1e9);   // LoTIS 路由用节点 id: map 点选取最近节点
+  if(kind==='S'){ start=o; startNode=nn; } else { goal=o; goalNode=nn; }
   const ph=document.getElementById(kind==='S'?'sPh':'gPh');
   ph.innerHTML=`<img src="/thumbs/kf${kf}.jpg">`;
   document.getElementById(kind==='S'?'sName':'gName').textContent=o.label;
@@ -481,13 +516,15 @@ function plan(){ path=null; pathLen=0; robot=null; stopAnim();
   document.getElementById('tLen').textContent=fmtM(pathLen);
   document.getElementById('tEta').textContent=isMetric? (pathLen*MPP/speed).toFixed(0)+' s':'-';
   document.getElementById('btnGo').disabled=false;
-  robot={t:0,pos:[...p[0]],dir:samplePath(0)[1]}; updateFPV(); staticDirty=true; }
+  robot={t:0,pos:[...p[0]],dir:samplePath(0)[1]}; updateFPV(); staticDirty=true;
+  if(navMode==='lotis') doLotisRoute(); }    // 仅 LoTIS 模式自动生成拓扑路线; A* 模式不碰 FPV/叠加
 
 // ---- 导航动画 ----
-function stopAnim(){ if(anim){cancelAnimationFrame(anim);anim=null;} }
+function stopAnim(){ if(anim){cancelAnimationFrame(anim);anim=null;} stopFpvPlay(); }
 function startNav(){ if(!path) return; stopAnim();
   robot={t:0,pos:[...path[0]],dir:samplePath(0)[1]};
   document.getElementById('modeTip').textContent='导航中';
+  startFpvPlay();                              // 视觉观察: 按图片加载完成逐帧播放(独立于 A* 速度)
   let last=performance.now();
   const step=(now)=>{
     const dt=(now-last)/1000; last=now;
@@ -522,16 +559,208 @@ function updateTele(){ if(!robot||!path) return;
 let fpvKf=-1;
 function updateFPV(){ const p=robot? robot.pos : (start? [start.x,start.y]:null);
   if(!p) return;
-  // 导航中按行进方向(robot.dir=路径切向,像素系)过滤同向拍摄的关键帧
-  const k=robot? nearestKF(p[0],p[1],Math.cos(robot.dir),Math.sin(robot.dir))
-               : nearestKF(p[0],p[1]);
-  if(k!==fpvKf){ fpvKf=k;
+  // LoTIS 模式: 视觉观察=按原始数据集**逐帧播放**的 LoTIS query(播放器 fpvPlay 独占, 与 A* 速度解耦),
+  // updateFPV 不碰 FPV; A* 模式: 走下面「最近关键帧跟随」缩略图(机器人朝向过滤)。
+  if(navMode==='lotis') return;
+  fpvKf=-1;                                    // 清掉路线态残留, 使无路线时下面能刷新
+  const k = robot? nearestKF(p[0],p[1],Math.cos(robot.dir),Math.sin(robot.dir))
+                 : nearestKF(p[0],p[1]);
+  { clearLotisDot();
     document.getElementById('fpv').src=`/thumbs/kf${k}.jpg`;
     document.getElementById('fpvIdx').textContent=`kf ${k} / frame ${D.kf[k].fid}`;
     const a=D.kf_ann[k];
     document.getElementById('fpvSem').textContent=a? `${a.name} · ${D.categories[a.cat].zh} (${a.conf})`:'-'; }
   const dx=(D.kf[k].px[0]-p[0]), dy=(D.kf[k].px[1]-p[1]);
   document.getElementById('fpvDist').textContent='观察点偏差 '+fmtM(Math.hypot(dx,dy)); }
+
+// ---- LoTIS 打点 (M6 自动: 观察帧变即自动打点, 当前路线边选最优段) ----
+// query=当前「视觉观察」帧(fpvKf)。center_pct 落在 query 帧中心方裁块内,
+// 按 query 图自身尺寸还原全帧像素, 再经 object-fit:contain 映射到显示框叠点。
+const fpvcv=document.getElementById('fpvcv'), fpvctx=fpvcv.getContext('2d');
+function clearLotisDot(){ if(fpvcv.width) fpvctx.clearRect(0,0,fpvcv.width,fpvcv.height); }
+function drawLotisDot(res){
+  const img=document.getElementById('fpv');
+  const cw=img.clientWidth, ch=img.clientHeight;
+  const iw=img.naturalWidth, ih=img.naturalHeight;   // query 帧原图尺寸(缩略图)
+  if(!cw||!ch||!iw||!ih) return;
+  fpvcv.width=cw; fpvcv.height=ch;
+  // center_pct 是相对 **query 帧** 的中心方裁块(段帧尺寸可能不同, 不能用 res.crop)。
+  // 用 query 图自身尺寸算方裁 + object-fit:contain 映射到显示框。
+  const s=Math.min(iw,ih), cl=(iw-s)/2, ct=(ih-s)/2;
+  const sc=Math.min(cw/iw, ch/ih), ox=(cw-iw*sc)/2, oy=(ch-ih*sc)/2;
+  const map=(cx,cy)=>[ox+(cl+cx*s)*sc, oy+(ct+cy*s)*sc];
+  const thr=res.vis_threshold!=null?res.vis_threshold:0.5;
+  const n=res.n_frames||1;
+  fpvctx.clearRect(0,0,cw,ch);
+  // 整段每帧投影点, 只画可见帧(vis>thr)
+  const pts=(res.track||[]).map(p=>{const[x,y]=map(p.x,p.y);return{x,y,vis:p.vis,frame:p.frame};})
+                           .filter(p=>p.vis>thr);
+  // 连线(沿帧序): 参考轨迹在当前视图里的走向
+  if(pts.length>=2){
+    fpvctx.beginPath();
+    pts.forEach((p,i)=> i? fpvctx.lineTo(p.x,p.y): fpvctx.moveTo(p.x,p.y));
+    fpvctx.strokeStyle='rgba(45,226,230,.5)'; fpvctx.lineWidth=2; fpvctx.stroke();
+  }
+  // 点串: 近段首(青)→段末(黄绿)按帧序渐变, 透明度随可见度
+  pts.forEach(p=>{
+    const t=p.frame/Math.max(1,n-1);
+    fpvctx.beginPath(); fpvctx.arc(p.x,p.y,3,0,7);
+    fpvctx.fillStyle=`hsla(${185-120*t},90%,60%,${0.35+0.6*Math.min(1,p.vis)})`; fpvctx.fill();
+  });
+  // 目标点(aim / center_pct)大圈高亮: 命中绿 / 参考黄
+  const [ax,ay]=map(res.center_pct.x,res.center_pct.y);
+  const col=res.found? '#39ff88':'#ffcf48';
+  fpvctx.beginPath(); fpvctx.arc(ax,ay,9,0,7); fpvctx.strokeStyle=col; fpvctx.lineWidth=3; fpvctx.stroke();
+  fpvctx.beginPath(); fpvctx.arc(ax,ay,3,0,7); fpvctx.fillStyle=col; fpvctx.fill();
+}
+// 自动打点(复用 M5 路线): query=当前观察帧 fpvKf, 候选=机器人所在路线边的所有段,
+// 后端各打一次选定位最优返回。fpvKf 一变即自动触发, 无需手动选段/按钮。
+function _distToSeg(px,py, ax,ay, bx,by){
+  const dx=bx-ax, dy=by-ay, L2=dx*dx+dy*dy;
+  let t=L2? ((px-ax)*dx+(py-ay)*dy)/L2 : 0; t=Math.max(0,Math.min(1,t));
+  return Math.hypot(px-(ax+t*dx), py-(ay+t*dy));
+}
+// 机器人当前所在的路线边 = steps 里离 pos 最近的那条边段
+function currentRouteStep(pos){
+  if(!lotisRoute||!lotisRoute.steps||!pos) return null;
+  let best=null, bd=Infinity;
+  for(const st of lotisRoute.steps){
+    const a=D.nodes[st.from], b=D.nodes[st.to]; if(!a||!b) continue;
+    const d=_distToSeg(pos[0],pos[1], a.px[0],a.px[1], b.px[0],b.px[1]);
+    if(d<bd){ bd=d; best=st; }
+  }
+  return best;
+}
+// ---- 视觉观察 = 逐帧播放的 LoTIS query 播放器(加载完成驱动) ----
+// 路线的连续原始帧(part 是同趟连续采集的分块, 后端拼成 steps[].frames=[[fid,seg,ts],...]) 组成时间线;
+// **以「图片真正加载出来 + 打点完成」为节拍一帧一帧走**(慢没关系, 不追时间戳、不跳帧), 与 A* 速度无关。
+let lotisTimeline=[];               // [{f, seg, ts, backward}]
+let fpvPlay={i:0, on:false};
+let _fpvToken=0;                    // 递增令牌: stop/翻页令在途的加载/打点作废
+
+function buildLotisTimeline(j){
+  lotisTimeline=[];
+  for(const st of (j.steps||[])){
+    if(!st.frames||!st.frames.length) continue;   // 捷径步无影像, 跳过
+    for(const fr of st.frames)
+      lotisTimeline.push({f:fr[0], seg:fr[1], ts:fr[2], backward:!!st.backward});
+  }
+}
+function _preload(url){       // 后台预载原图进缓存(不动可见的 #fpv)
+  return new Promise(res=>{ const im=new Image(); im.onload=()=>res(); im.onerror=()=>res(); im.src=url; });
+}
+async function _fetchPoint(item){   // 对该帧打点; 出错返回 null
+  try{ const r=await fetch('/api/lotis_point',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({seg_key:item.seg, query_frame:item.f, backward:!!item.backward})});
+    return await r.json();
+  }catch(e){ return null; }
+}
+// 显示第 idx 帧: **图与打点并行准备好后, 一次性换可见图 + 叠点**。
+// 这样当前帧的图带着点一直留到下一帧就绪(不会一画就被清), 图/点永远对应同一帧。
+async function showFrameAndPoint(idx){
+  if(idx<0||idx>=lotisTimeline.length) return;
+  const item=lotisTimeline[idx], tok=++_fpvToken; fpvPlay.i=idx;
+  const url=`/raw/${item.f}`;
+  const [, j]=await Promise.all([_preload(url), _fetchPoint(item)]);   // 节拍基准: 二者都就绪
+  if(tok!==_fpvToken) return;                       // 期间已翻页/停止 -> 丢弃
+  const img=document.getElementById('fpv');
+  img.src=url; try{ await img.decode(); }catch(e){}  // 换可见图(已缓存, 秒切); 等解码好再叠点
+  if(tok!==_fpvToken) return;
+  document.getElementById('fpvIdx').textContent=`原始帧 ${item.f} (${idx+1}/${lotisTimeline.length})`;
+  document.getElementById('fpvSem').textContent='LoTIS query';
+  document.getElementById('fpvDist').textContent='';
+  clearLotisDot();
+  const msg=document.getElementById('lotisMsg');
+  if(j && j.ok){ drawLotisDot(j);
+    const mtag=j.aim_method==='lookahead'?'前瞻':'回退';
+    msg.className=j.found?'lotismsg ok':'lotismsg';
+    msg.textContent=`${j.found?'✓命中':'○参考'} ${item.seg}${item.backward?'↩':''} · 帧${item.f} · 点串${j.visible}/${j.n_frames} · aim${j.aim_frame}(${mtag}) · 置信${(j.confidence||0).toFixed(2)}`;
+  } else { msg.className='lotismsg err'; msg.textContent='○ '+((j&&j.reason)||'无点'); }
+}
+async function startFpvPlay(){
+  if(!lotisTimeline.length) return;
+  stopFpvPlay();
+  fpvPlay.on=true; fpvPlay.i=0;
+  while(fpvPlay.on && fpvPlay.i<lotisTimeline.length){
+    const idx=fpvPlay.i;
+    await showFrameAndPoint(idx);                  // 载图+打点全就绪才继续
+    if(!fpvPlay.on || fpvPlay.i!==idx) break;      // 被停止/重置
+    fpvPlay.i=idx+1;
+  }
+  fpvPlay.on=false;                                // 到头即停
+}
+function stopFpvPlay(){ fpvPlay.on=false; _fpvToken++; }
+function showFpvFrame(idx){ stopFpvPlay(); fpvPlay.i=idx; showFrameAndPoint(idx); }   // 单帧预览(不播放)
+
+// ---- LoTIS 拓扑图 + 路径规划 (第二部分) ----
+let lotisGraph=null, lotisRoute=null, startNode=null, goalNode=null;
+async function loadLotisGraph(){
+  try{ const j=await (await fetch('/api/lotis_graph')).json();
+    if(j.ok){ lotisGraph=j; staticDirty=true; } }catch(e){}
+}
+let _lastLotisReq='';
+async function doLotisRoute(){
+  const msg=document.getElementById('lotisRouteMsg');
+  // 起终点节点: 优先显式选的节点; 否则(map 点选/VPR 定位)取离起终点最近的节点
+  const sN = startNode!=null? startNode : (start? nearestNode(start.x,start.y,1e9):-1);
+  const gN = goalNode!=null? goalNode : (goal? nearestNode(goal.x,goal.y,1e9):-1);
+  if(sN<0||gN<0){ msg.className='lotismsg err';
+    msg.textContent='请先设起点和终点'; return; }
+  const key=sN+'>'+gN;
+  if(key===_lastLotisReq && lotisRoute) return;   // 同一对起终点已规划, 不重复请求(plan 每次触发去重)
+  _lastLotisReq=key;
+  msg.className='lotismsg'; msg.textContent='规划中…';
+  try{
+    const j=await (await fetch('/api/lotis_route',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({start_node:sN, goal_node:gN})})).json();
+    if(!j.ok){ msg.className='lotismsg err'; msg.textContent='✗ '+j.reason; lotisRoute=null; _lastLotisReq=''; staticDirty=true; return; }
+    lotisRoute=j; staticDirty=true;
+    const nmn=j.steps.filter(s=>s.kind==='mined').length;
+    const nsc=j.steps.filter(s=>s.kind==='shortcut').length;
+    msg.className='lotismsg ok';
+    msg.textContent=`✓ ${j.path_nodes.length}点/${j.steps.length}段(含${nmn}闭环${nsc?'/'+nsc+'盲跨':''}): `+j.path_names.join(' → ');
+    renderLotisSteps(j);
+    buildLotisTimeline(j);                     // 拼路线连续原始帧时间线
+    stopFpvPlay();
+    if(lotisTimeline.length) showFpvFrame(0);   // 先停在首帧(点"开始导航"才播放)
+  }catch(e){ msg.className='lotismsg err'; msg.textContent='✗ '+e; _lastLotisReq=''; }
+}
+function renderLotisSteps(r){
+  const el=document.getElementById('lotisSteps');
+  el.innerHTML=r.steps.map((s,i)=>{
+    const nm=`${D.nodes[s.from].name}→${D.nodes[s.to].name}`;
+    if(s.kind==='shortcut')
+      return `<div class="lstep"><span>#${i} ${nm}</span><span class="tag sc">盲跨${s.dist_m}m</span></div>`;
+    const isM=s.kind==='mined';
+    return `<div class="lstep"><span>#${i} ${nm}</span><span class="tag${isM?' mn':''}">${isM?'闭环·':''}${s.backward?'反向':'正向'}·${s.seg_keys.length}段</span></div>`;
+  }).join('');
+}
+document.getElementById('btnLotisRoute').addEventListener('click', doLotisRoute);
+loadLotisGraph();
+
+// ---- 导航模式开关: A* / LoTIS 两种只显示一种 ----
+function setNavMode(m){
+  if(m===navMode) return;
+  navMode=m;
+  document.getElementById('btnModeAstar').classList.toggle('on', m==='astar');
+  document.getElementById('btnModeLotis').classList.toggle('on', m==='lotis');
+  document.getElementById('lotisPanel').style.display = m==='lotis' ? '' : 'none';
+  stopFpvPlay();
+  if(m==='astar'){
+    // 回到 A* 视觉观察: 丢弃 LoTIS 路线/时间线, 关键帧跟随重新接管 FPV
+    lotisRoute=null; _lastLotisReq=''; lotisTimeline=[]; clearLotisDot();
+    document.getElementById('lotisSteps').innerHTML='';
+    document.getElementById('lotisRouteMsg').textContent='';
+    updateFPV();
+  } else {
+    // 进 LoTIS 模式: 若已有起终点, 生成拓扑路线并停在首帧
+    if(start && goal) doLotisRoute();
+  }
+  staticDirty=true;
+}
+document.getElementById('btnModeAstar').onclick=()=>setNavMode('astar');
+document.getElementById('btnModeLotis').onclick=()=>setNavMode('lotis');
 
 // ---- 渲染 ----
 function renderStatic(){ octx.clearRect(0,0,W,H);
@@ -554,6 +783,16 @@ function renderStatic(){ octx.clearRect(0,0,W,H);
   // kf 点 (小倍率下密集成链珠噪声, 放大后才显示)
   if(view.scale>1.6){ octx.fillStyle='rgba(45,226,230,.3)';
     D.kf.forEach(k=>{ const[sx,sy]=p2s(k.px[0],k.px[1]); octx.fillRect(sx-1,sy-1,2,2); }); }
+  // LoTIS 拓扑边: walk(蓝灰实线, 采集顺序) + mined(绿实线, 空间闭环挖出的可打点边) + 捷径(橙虚线, 旧盲跨)
+  if(lotisGraph && navMode==='lotis'){
+    lotisGraph.edges.forEach(e=>{ const a=D.nodes[e.u], b=D.nodes[e.v]; if(!a||!b) return;
+      const[ax,ay]=p2s(a.px[0],a.px[1]),[bx,by]=p2s(b.px[0],b.px[1]);
+      if(e.kind==='shortcut'){ octx.strokeStyle='rgba(255,160,60,.5)'; octx.lineWidth=1.4; octx.setLineDash([5,4]); }
+      else if(e.kind==='mined'){ octx.strokeStyle='rgba(40,210,130,.75)'; octx.lineWidth=2.4; octx.setLineDash([]); }
+      else { octx.strokeStyle='rgba(150,180,220,.35)'; octx.lineWidth=1.6; octx.setLineDash([]); }
+      octx.beginPath(); octx.moveTo(ax,ay); octx.lineTo(bx,by); octx.stroke(); });
+    octx.setLineDash([]);
+  }
   // 语义节点 + 胶囊标签 (贪心防重叠: 与已放标签相交则隐藏, 选中/悬停强制显示)
   const placed=[];
   D.nodes.forEach((n,i)=>{ const[sx,sy]=p2s(n.px[0],n.px[1]);
@@ -585,13 +824,26 @@ function renderStatic(){ octx.clearRect(0,0,W,H);
 
 function render(){ if(staticDirty) renderStatic();
   ctx.clearRect(0,0,W,H); ctx.drawImage(off,0,0,W,H);
-  // 路线 (发光绿)
-  if(path){ ctx.save(); ctx.strokeStyle='#5cff9d'; ctx.lineWidth=3;
+  // 路线 (发光绿) —— A* 模式专属; LoTIS 模式改画拓扑路线
+  if(path && navMode==='astar'){ ctx.save(); ctx.strokeStyle='#5cff9d'; ctx.lineWidth=3;
     ctx.shadowColor='#5cff9d'; ctx.shadowBlur=12; ctx.beginPath();
     path.forEach((p,i)=>{ const[sx,sy]=p2s(p[0],p[1]);
       const tp=i&&Math.max(Math.abs(p[0]-path[i-1][0]),Math.abs(p[1]-path[i-1][1]))>JUMP;
       (!i||tp)?ctx.moveTo(sx,sy):ctx.lineTo(sx,sy); });   // 传送门段断开
     ctx.stroke(); ctx.restore(); }
+  // LoTIS 规划路线(节点序列: walk 洋红实线 / 捷径 橙虚线) —— LoTIS 模式专属
+  if(lotisRoute && lotisRoute.path_nodes && navMode==='lotis'){ ctx.save(); ctx.lineWidth=3.5;
+    const pn=lotisRoute.path_nodes;
+    for(let i=1;i<pn.length;i++){ const a=D.nodes[pn[i-1]],b=D.nodes[pn[i]],st=lotisRoute.steps[i-1];
+      const[ax,ay]=p2s(a.px[0],a.px[1]),[bx,by]=p2s(b.px[0],b.px[1]);
+      const sc=st&&st.kind==='shortcut', mn=st&&st.kind==='mined';
+      ctx.strokeStyle=sc?'#ff9a3c':(mn?'#28d27f':'#ff4fd8'); ctx.shadowColor=ctx.strokeStyle; ctx.shadowBlur=10;
+      ctx.setLineDash(sc?[6,5]:[]);
+      ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(bx,by); ctx.stroke(); }
+    ctx.setLineDash([]); ctx.shadowBlur=0; ctx.fillStyle='#ff4fd8';
+    pn.forEach(id=>{ const[sx,sy]=p2s(D.nodes[id].px[0],D.nodes[id].px[1]);
+      ctx.beginPath(); ctx.arc(sx,sy,4,0,7); ctx.fill(); });
+    ctx.restore(); }
   // 起终点
   if(start) drawFlag(start,'#2de2e6','S');
   if(goal) drawFlag(goal,'#5cff9d','G');
@@ -658,6 +910,8 @@ function setMode(m){ mode=m;
 document.getElementById('btnPickS').onclick=()=>setMode(mode==='pickS'?'idle':'pickS');
 document.getElementById('btnPickG').onclick=()=>setMode(mode==='pickG'?'idle':'pickG');
 document.getElementById('btnReset').onclick=()=>{ start=goal=null; path=null; robot=null; stopAnim();
+  startNode=goalNode=null; lotisRoute=null; _lastLotisReq=''; stopFpvPlay(); lotisTimeline=[]; clearLotisDot(); staticDirty=true;
+  document.getElementById('lotisSteps').innerHTML=''; document.getElementById('lotisRouteMsg').textContent='';
   selNode=-1; ['sPh','gPh'].forEach((id,ix)=>document.getElementById(id).textContent=ix?'点选 / 语言':'点选 / 语言 / 图像');
   document.getElementById('sName').textContent='未设置';
   document.getElementById('gName').textContent='未设置';
@@ -688,9 +942,11 @@ function selectNode(i,center){ selNode=i; staticDirty=true;
   if(center){ const n=D.nodes[i]; view.cx=n.px[0]; view.cy=n.px[1];
     view.scale=Math.max(view.scale,2.4); staticDirty=true; }
   const n=D.nodes[i];
-  document.getElementById('fpv').src=`/thumbs/kf${n.rep_kf}.jpg`; fpvKf=n.rep_kf;
-  document.getElementById('fpvIdx').textContent=`kf ${n.rep_kf} (${n.name} 代表帧)`;
-  document.getElementById('fpvSem').textContent=`${n.name} · ${n.cat_zh}`; }
+  if(!lotisRoute){                             // 无 LoTIS 路线时才用代表帧(有路线则视觉观察归播放器)
+    document.getElementById('fpv').src=`/thumbs/kf${n.rep_kf}.jpg`; fpvKf=n.rep_kf; clearLotisDot();
+    document.getElementById('fpvIdx').textContent=`kf ${n.rep_kf} (${n.name} 代表帧)`;
+    document.getElementById('fpvSem').textContent=`${n.name} · ${n.cat_zh}`;
+  } }
 
 // ---- 自然语言 ----
 async function nlQuery(kind){ const t=document.getElementById('nlText').value.trim();

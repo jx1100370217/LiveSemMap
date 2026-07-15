@@ -7,20 +7,20 @@
 # 命令行参数仍可用且优先于本文件。
 # ============================================================
 
-# ---- 数据集: cfds_floor28 创富大厦28楼 (insight9 新格式, VIO 米制, 无标定) ----
+# ---- 数据集: cfds_floor28 创富大厦28楼 ----
 dataset: datasets/cfds_floor28
 config: config/cfds_floor28.yaml
 calib: ""                           # 新 insight9 数据无相机内参 -> 无标定模式
 vio: datasets/cfds_floor28/vio.txt  # VIO 度量轨迹; 纯 RGB 数据集置空 ""
-vio: ""
+# vio: ""
 save_as: cfds_floor28_run           # 产物目录 logs/<save_as>/
 
-# ---- 数据集: cfds_floor1 创富大厦1楼 (用时取消注释并注释掉上面一组) ----
+# ---- 数据集: cfds_floor1 创富大厦1楼  ----
 # dataset: datasets/cfds_floor1
 # config: config/cfds_floor1.yaml
 # calib: ""
-# # vio: datasets/cfds_floor1/vio.txt
-# vio: ""
+# vio: datasets/cfds_floor1/vio.txt
+# # vio: ""
 # save_as: cfds_floor1_run
 
 # ---- 数据集: Mapping_C8 (纯 RGB) ----
