@@ -538,9 +538,17 @@ def render_rooms_png(run_dir, seq, scale=3, fill_alpha=110):
 
     d = ImageDraw.Draw(img, "RGBA")
     ctr = {r["id"]: _rpx(r) for r in live}
-    for e in rj["edges"]:                    # 门口边
-        if e["a"] in ctr and e["b"] in ctr:
-            d.line([ctr[e["a"]], ctr[e["b"]]], fill=(255, 255, 255, 120), width=2)
+    for e in rj["edges"]:                    # 门口边: 折经真实过门点(via_kf 处),
+        if e["a"] not in ctr or e["b"] not in ctr:   # 房心直连会斜穿无关空间
+            continue
+        pts = [ctr[e["a"]], ctr[e["b"]]]
+        v = e.get("via_kf", -1)
+        if 0 <= v < len(kf_px):
+            vx, vy = float(kf_px[v][0]) * scale, float(kf_px[v][1]) * scale
+            pts.insert(1, (vx, vy))
+            d.ellipse([vx - 3, vy - 3, vx + 3, vy + 3],
+                      fill=(255, 255, 255, 220))   # 门位标记
+        d.line(pts, fill=(255, 255, 255, 120), width=2)
     font = _get_font(max(12, G * scale // 60))
     placed = []                              # 标签贪心避让: 相交则下移重试
     for i, r in enumerate(live):

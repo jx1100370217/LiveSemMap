@@ -852,8 +852,14 @@ function renderStatic(){ octx.clearRect(0,0,W,H);
     D.rooms.edges.forEach(e=>{ const A=rid2[e.a], B=rid2[e.b];
       if(!A||!B||!A.px||!B.px) return;
       const[ax,ay]=p2s(A.px[0],A.px[1]), [bx,by]=p2s(B.px[0],B.px[1]);
-      octx.beginPath(); octx.moveTo(ax,ay); octx.lineTo(bx,by); octx.stroke(); });
+      octx.beginPath(); octx.moveTo(ax,ay);
+      if(e.via_px){ const[vx,vy]=p2s(e.via_px[0],e.via_px[1]); octx.lineTo(vx,vy); }
+      octx.lineTo(bx,by); octx.stroke(); });
     octx.setLineDash([]);
+    octx.fillStyle='rgba(255,255,255,.85)';   // 门位标记 (真实过门点)
+    D.rooms.edges.forEach(e=>{ if(!e.via_px) return;
+      const[vx,vy]=p2s(e.via_px[0],e.via_px[1]);
+      octx.beginPath(); octx.arc(vx,vy,2.5,0,7); octx.fill(); });
     const rplaced=[];
     D.rooms.rooms.forEach(r=>{ if(!r.px) return; const[sx,sy]=p2s(r.px[0],r.px[1]);
       octx.fillStyle=r.color; octx.strokeStyle='rgba(255,255,255,.9)'; octx.lineWidth=1.5;

@@ -104,8 +104,15 @@ def main():
                     "px": rpx, "n_kfs": len(r["kf_indices"]),
                     "sig": r["signage"][:4],
                 })
+            def _via_px(e):   # 过门点像素 (边折线经此, 不房心直连斜穿地图)
+                v = e.get("via_kf", -1)
+                if 0 <= v < len(kf_px):
+                    return [round(float(kf_px[v][0]), 1),
+                            round(float(kf_px[v][1]), 1)]
+                return None
             rooms_js = {"rooms": rooms, "region": region_rows,
-                        "edges": [{"a": e["a"], "b": e["b"], "kind": e["kind"]}
+                        "edges": [{"a": e["a"], "b": e["b"], "kind": e["kind"],
+                                   "via_px": _via_px(e)}
                                   for e in rj["edges"]]}
             print(f"[export_web] 房间图层: {len(rooms)} 房间, {len(rj['edges'])} 边")
 
