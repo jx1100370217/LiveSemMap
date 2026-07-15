@@ -71,6 +71,44 @@ def main():
             "color": "#%02x%02x%02x" % tuple(int(c * 255) for c in color),
         })
 
+    # 房间拓扑 (rooms.json 可选): 可行走区按房间划分的行字符串 + 房间节点/门边,
+    # 供前端"房间图"图层把平面布局着色画在底图上
+    rooms_js = None
+    rp = run / f"{args.seq}_rooms.json"
+    if rp.exists():
+        from mast3r_slam.room_topo import (ROOM_PALETTE, assign_room_regions)
+        rj = json.loads(rp.read_text())
+        live = [r for r in rj["rooms"] if r["status"] != "merged"]
+        if live:
+            px_per_m = G / (2 * meta["half"])
+            region = assign_room_regions(
+                grid, kf_px, live,
+                corridor_px=max(2, int(round(0.5 * px_per_m))),
+                jump_px=max(10, int(3.0 * px_per_m)))
+            digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            region_rows = ["".join("." if v < 0 or v >= len(digits) else digits[v]
+                                   for v in row) for row in region]
+            rooms = []
+            for i, r in enumerate(live):
+                if r.get("position"):
+                    rpx = to_px(np.asarray(r["position"]))
+                else:
+                    ks = [k for k in r["kf_indices"] if k < len(kf_px)]
+                    x, y = kf_px[ks[len(ks) // 2]]
+                    rpx = [round(float(x), 1), round(float(y), 1)]
+                zh = SEMANTIC_CATEGORIES.get(r["room_type"] or "other", ("?",))[0]
+                rooms.append({
+                    "id": r["id"], "name": r["name"], "type": r["room_type"],
+                    "zh": zh, "desc": r["description"],
+                    "color": ROOM_PALETTE[i % len(ROOM_PALETTE)],
+                    "px": rpx, "n_kfs": len(r["kf_indices"]),
+                    "sig": r["signage"][:4],
+                })
+            rooms_js = {"rooms": rooms, "region": region_rows,
+                        "edges": [{"a": e["a"], "b": e["b"], "kind": e["kind"]}
+                                  for e in rj["edges"]]}
+            print(f"[export_web] 房间图层: {len(rooms)} 房间, {len(rj['edges'])} 边")
+
     # 每个关键帧的标注摘要 (FPV 面板显示当前位置语义)
     kf_ann = {}
     for k, v in sem.get("annotations", {}).items():
@@ -157,6 +195,7 @@ def main():
                for (x, y), f, d in zip(kf_px, frame_ids, kf_dir)],
         "kf_ann": kf_ann,
         "nodes": nodes,
+        "rooms": rooms_js,               # 房间图层数据 (无 rooms.json 时为 null)
         "categories": {k: {"zh": v[0],
                            "color": "#%02x%02x%02x" % tuple(int(c * 255) for c in v[1]),
                            "landmark": v[2]}

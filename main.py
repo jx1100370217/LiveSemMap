@@ -262,6 +262,7 @@ if __name__ == "__main__":
     # (viewer 读它画 BEV 语义节点; 退出时聚合保存 semantic.json)
     semantic_ann = manager.dict()
     annotator = None
+    room_builder = None
     if args.semantic_api:
         surround_dir = pathlib.Path(args.dataset) / "surround"
         if surround_dir.is_dir():
@@ -272,6 +273,13 @@ if __name__ == "__main__":
             print(f"[semantic] 语义标注已启用: {args.semantic_api} "
                   f"({args.semantic_model}, 环视图 {surround_dir}, "
                   f"空间抽稀 {args.semantic_thin}m)")
+            # 房间级拓扑建图: 在线消费空间结构标注, 切房间段/建门口边 (纯图像,
+            # 位置仅用 VIO 做合并判据; 纯 RGB 时退化为 signage 合并)
+            from mast3r_slam.room_topo import RoomTopoBuilder
+            room_builder = RoomTopoBuilder(
+                pos_fn=vio_prior.position if vio_prior is not None else None,
+                api_url=args.semantic_api, model=args.semantic_model,
+                surround_dir=surround_dir)
         else:
             print(f"[semantic] 数据集无环视图目录 {surround_dir}, 语义标注关闭")
 
@@ -374,6 +382,8 @@ if __name__ == "__main__":
             tracker = FrameTracker(model, keyframes, device)
             if annotator is not None:  # 语义标注同步清零(kf_idx 从 0 复用)
                 annotator.reset()
+            if room_builder is not None:
+                room_builder.reset()
             if inc_saver is not None:
                 inc_saver.reset()
             i = 0
@@ -496,6 +506,8 @@ if __name__ == "__main__":
         if annotator is not None:
             annotator.catch_up(keyframes,
                                pos_fn=vio_prior.position if vio_prior is not None else None)
+            if room_builder is not None:  # 房间拓扑: 按 kf 序消费新完成的标注
+                room_builder.tick(semantic_ann, annotator.min_inflight())
             # In single threaded mode, wait for the backend to finish
             while config["single_thread"]:
                 with states.lock:
@@ -539,7 +551,7 @@ if __name__ == "__main__":
                 traceback.print_exc()
                 print(f"[save {idx}/{total}] {name} 失败, 跳过并继续保存其余产物", flush=True)
 
-        n_steps = 8
+        n_steps = 9
         print(f"[save] 开始保存全部地图产物到 {save_dir} (共 {n_steps} 步, "
               f"约 1-3 分钟, 请勿关闭终端; 此时按 Ctrl-C 会丢失未保存产物)", flush=True)
         _save_step(1, n_steps, "轨迹", lambda: eval.save_traj(
@@ -562,19 +574,30 @@ if __name__ == "__main__":
         _save_step(6, n_steps, "语义地图/占据栅格", lambda: eval.save_semantic_map(
             save_dir, seq_name, keyframes, semantic_ann, vio_prior,
             last_msg.C_conf_threshold))
+        # 房间拓扑图: drain 后先补消费全部标注, 再关末房/等 VLM 定稿, 落盘
+        if room_builder is not None:
+            def _save_rooms():
+                room_builder.tick(semantic_ann, annotator.min_inflight())
+                room_builder.finalize()
+                room_builder.save(save_dir / f"{seq_name}_rooms.json")
+                from mast3r_slam.room_topo import render_rooms_png
+                render_rooms_png(save_dir, seq_name)  # 依赖 step6 的 occupancy
+            _save_step(7, n_steps, "房间拓扑图", _save_rooms)
+        else:
+            print(f"[save 7/{n_steps}] 语义标注未启用, 跳过房间拓扑图", flush=True)
         if not args.no_vpr:
-            _save_step(7, n_steps, "SelaVPR 描述子", lambda: eval.save_vpr_descriptors(
+            _save_step(8, n_steps, "SelaVPR 描述子", lambda: eval.save_vpr_descriptors(
                 save_dir, seq_name, keyframes))
         else:
-            print(f"[save 7/{n_steps}] --no-vpr, 跳过 SelaVPR 描述子", flush=True)
+            print(f"[save 8/{n_steps}] --no-vpr, 跳过 SelaVPR 描述子", flush=True)
         # LoTIS 记忆分段: 按语义节点边切段(+junction 拐弯段), 逐段预编码, 供导航打点。
         # 依赖 step 6 的 {seq}_semantic.json; 段帧=原始帧, 图取自 datasets/*.png(kf->原始帧映射读 occupancy)。
         if not args.no_lotis:
             from mast3r_slam import lotis_memory
-            _save_step(8, n_steps, "LoTIS 记忆分段", lambda: lotis_memory.save_lotis_memory(
+            _save_step(9, n_steps, "LoTIS 记忆分段", lambda: lotis_memory.save_lotis_memory(
                 save_dir, seq_name, args.dataset))
         else:
-            print(f"[save 8/{n_steps}] --no-lotis, 跳过 LoTIS 记忆分段", flush=True)
+            print(f"[save 9/{n_steps}] --no-lotis, 跳过 LoTIS 记忆分段", flush=True)
         print(f"[save] 产物保存流程结束 -> {save_dir}", flush=True)
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")
