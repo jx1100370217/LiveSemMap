@@ -60,8 +60,9 @@ def main():
     b.tick(ann, min_inflight=1 << 30)   # 一次按 kf 序重放全部
     b.finalize()
     b.save(run / f"{args.seq}_rooms.json")
-    from mast3r_slam.room_topo import render_rooms_png
+    from mast3r_slam.room_topo import render_rooms_png, render_rooms_layout_png
     render_rooms_png(run, args.seq)
+    render_rooms_layout_png(run, args.seq)
 
     snap = b.snapshot()
     live = [r for r in snap["rooms"] if r["status"] != "merged"]

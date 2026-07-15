@@ -580,8 +580,10 @@ if __name__ == "__main__":
                 room_builder.tick(semantic_ann, annotator.min_inflight())
                 room_builder.finalize()
                 room_builder.save(save_dir / f"{seq_name}_rooms.json")
-                from mast3r_slam.room_topo import render_rooms_png
+                from mast3r_slam.room_topo import (render_rooms_png,
+                                                   render_rooms_layout_png)
                 render_rooms_png(save_dir, seq_name)  # 依赖 step6 的 occupancy
+                render_rooms_layout_png(save_dir, seq_name)  # 独立楼层平面布局图
             _save_step(7, n_steps, "房间拓扑图", _save_rooms)
         else:
             print(f"[save 7/{n_steps}] 语义标注未启用, 跳过房间拓扑图", flush=True)

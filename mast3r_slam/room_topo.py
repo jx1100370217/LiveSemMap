@@ -243,10 +243,18 @@ class RoomTopoBuilder:
         for r in self.rooms:
             if r["status"] != "closed" or r["id"] == cur["id"]:
                 continue
-            # 强判据: 专属文字标识交集 + 主类别相同 (走廊路过门口也会读到门牌,
-            # 故必须同类才认; A电梯/B电梯 等不同标识天然不交)
+            # 强判据: 专属文字标识交集 + 主类别相同 + 空间贴近(有位置时)。
+            # 同类约束: 走廊路过门口也会读到门牌; A电梯/B电梯 等标识天然不交。
+            # 距离约束(最近成员而非 medoid, 长走廊回访也能贴上): 沿途门牌会被
+            # 相邻多个走廊段共享, 无距离限制曾把全楼走廊链式并成一个 491kf 巨房。
             if cur_sig & r["signage"] and self._vote_type(r) == cur_type:
-                return r["id"]
+                if cur_pos is None or not r["positions"]:
+                    return r["id"]
+                dmin = float(np.linalg.norm(
+                    np.asarray(r["positions"]) - cur_pos, axis=1).min())
+                if dmin < self.merge_dist * 2:
+                    return r["id"]
+                continue   # 远距同名: 不并, 也不再看空间判据
             # 空间判据: 距历史房 medoid 近 + 形态与类别都兼容; 双方都有标识但
             # 不交 -> 是不同房间, 不并
             if cur_pos is None or not r["positions"]:
@@ -575,4 +583,106 @@ def render_rooms_png(run_dir, seq, scale=3, fill_alpha=110):
     out = run / f"{seq}_rooms.png"
     img.save(out)
     print(f"[room] 平面布局图 -> {out} ({len(live)} 房间)")
+    return out
+
+
+def room_label_cells(region, n_rooms):
+    """每个房间的标签锚点 (区域内离质心最近的格, L 形/环形区域不落到区域外)。
+    返回 {房间下标: (x, y) 像素}。"""
+    anchors = {}
+    for i in range(n_rooms):
+        ys, xs = np.nonzero(region == i)
+        if not len(xs):
+            continue
+        cx, cy = xs.mean(), ys.mean()
+        k = int(np.argmin((xs - cx) ** 2 + (ys - cy) ** 2))
+        anchors[i] = (float(xs[k]), float(ys[k]))
+    return anchors
+
+
+def render_rooms_layout_png(run_dir, seq, scale=3):
+    """渲染 HOV-SG 风格楼层平面布局图 (独立成图, 无几何底图/轨迹/POI):
+    可行走区按房间测地划分, 每房间一色**实心区域** + 深色描边 + 名称标签,
+    门位画小圆点。白底类平面图纸观感。输出 {seq}_rooms_layout.png。"""
+    from PIL import Image, ImageDraw
+
+    from mast3r_slam.mapping2d import _get_font
+
+    run = pathlib.Path(run_dir)
+    z = np.load(run / f"{seq}_occupancy.npz")
+    grid, kf_px = z["grid"], z["kf_px"]
+    meta = json.loads(str(z["meta"]))
+    rj = json.loads((run / f"{seq}_rooms.json").read_text())
+    live = [r for r in rj["rooms"] if r["status"] != "merged"]
+    if not live:
+        return None
+    G = grid.shape[0]
+    px_per_m = G / (2 * meta["half"])
+    region = assign_room_regions(grid, kf_px, live,
+                                 corridor_px=max(2, int(round(0.5 * px_per_m))),
+                                 jump_px=max(10, int(3.0 * px_per_m)))
+
+    cols = np.array([_hex_rgb(ROOM_PALETTE[i % len(ROOM_PALETTE)])
+                     for i in range(len(live))], np.float32)
+    base = np.full((G, G, 3), 255.0, np.float32)      # 白底
+    fill = region >= 0
+    base[fill] = cols[region[fill]]                   # 实心区域
+    edge = np.zeros((G, G), bool)                     # 房间边界描深色
+    pad = np.full((G + 2, G + 2), -2, np.int16)
+    pad[1:-1, 1:-1] = region
+    for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nb = pad[1 + di:G + 1 + di, 1 + dj:G + 1 + dj]
+        edge |= fill & (nb != region)
+    base[edge] = cols[region[edge]] * 0.45
+    img = Image.fromarray(np.clip(base, 0, 255).astype(np.uint8)) \
+        .resize((G * scale, G * scale), Image.NEAREST)
+
+    d = ImageDraw.Draw(img, "RGBA")
+    for e in rj["edges"]:                             # 门位: 深色小圆点
+        v = e.get("via_kf", -1)
+        if 0 <= v < len(kf_px):
+            vx, vy = float(kf_px[v][0]) * scale, float(kf_px[v][1]) * scale
+            d.ellipse([vx - 5, vy - 5, vx + 5, vy + 5],
+                      fill=(30, 34, 46, 255), outline=(255, 255, 255, 255),
+                      width=2)
+    f_name, f_sub = _get_font(max(14, G * scale // 55)), \
+        _get_font(max(11, G * scale // 80))
+    anchors = room_label_cells(region, len(live))
+    placed = []
+
+    def _hit(box):
+        return any(box[0] < p[2] and box[2] > p[0]
+                   and box[1] < p[3] and box[3] > p[1] for p in placed)
+
+    for i, r in enumerate(live):
+        if i not in anchors or f_name is None:
+            continue
+        x, y = anchors[i][0] * scale, anchors[i][1] * scale
+        name = r["name"] or (r["room_type"] or "?")
+        zh = SEMANTIC_CATEGORIES.get(r["room_type"] or "other", ("?",))[0]
+        sub = f"{zh} · {len(r['kf_indices'])}kf"
+        tw = max(d.textlength(name, font=f_name), d.textlength(sub, font=f_sub))
+        bh = f_name.size + f_sub.size + 8
+        W_ = G * scale
+        bx = float(np.clip(x - tw / 2, 4, W_ - tw - 4))
+        by = float(np.clip(y - bh / 2, 4, W_ - bh - 4))
+        for _ in range(10):
+            if not _hit((bx, by, bx + tw, by + bh)):
+                break
+            by += f_name.size + 6
+        placed.append((bx, by, bx + tw, by + bh))
+        d.text((bx + (tw - d.textlength(name, font=f_name)) / 2, by), name,
+               font=f_name, fill=(20, 24, 34, 255), stroke_width=3,
+               stroke_fill=(255, 255, 255, 235))
+        d.text((bx + (tw - d.textlength(sub, font=f_sub)) / 2,
+                by + f_name.size + 4), sub, font=f_sub,
+               fill=(70, 80, 100, 255), stroke_width=2,
+               stroke_fill=(255, 255, 255, 235))
+    if f_sub is not None:
+        d.text((20, G * scale - f_sub.size - 16),
+               f"{seq} 楼层平面布局  (房间=已观测可行走区的测地划分; ● 门位)",
+               font=f_sub, fill=(110, 120, 140, 255))
+    out = run / f"{seq}_rooms_layout.png"
+    img.save(out)
+    print(f"[room] 楼层平面布局图 -> {out} ({len(live)} 房间)")
     return out
