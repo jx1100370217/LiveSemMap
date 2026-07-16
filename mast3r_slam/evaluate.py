@@ -140,6 +140,54 @@ def save_reconstruction_vio(savedir, filename, keyframes, vio_prior, c_conf_thre
     print(f"[VIO重建] 尺度 s={s:.4f} m/单位, {len(P)} 点 -> {filename} (无漂移米制图)")
 
 
+def save_kf_pointmaps(savedir, seq_name, keyframes, vio_prior, c_conf_threshold):
+    """逐关键帧**有组织**世界系点图 (HMSG 物体层把 2D 掩码提升到 3D 用)。
+
+    与 save_reconstruction_vio 同一几何: VIO 可用时 相机系点 x 全局尺度 s 后用
+    VIO 位姿摆放 (米制/无漂移); 否则 SLAM Sim3 位姿 (尺度未知)。
+    产物 {seq}_kf_pointmaps.npz: X(N,h,w,3) float16 世界系点图 /
+    conf(N,h,w) float16 / frame_ids(N) / coordinate / conf_threshold。
+    """
+    savedir = pathlib.Path(savedir)
+    N = len(keyframes)
+    use_vio = vio_prior is not None
+    s, vio_p, vio_R = 1.0, None, None
+    if use_vio:
+        mast_c, vio_p, vio_R = [], [], []
+        for i in range(N):
+            kf = keyframes[i]
+            mast_c.append(kf.T_WC.matrix().reshape(-1, 4, 4)[0, :3, 3].cpu().numpy())
+            p, R = vio_prior._pose_at(int(kf.frame_id))
+            vio_p.append(p)
+            vio_R.append(R.as_matrix())
+        mast_c, vio_p, vio_R = np.array(mast_c), np.array(vio_p), np.array(vio_R)
+        s = _vio_scale(mast_c, vio_p, vio_prior)
+    Xs, confs, fids = [], [], []
+    for i in range(N):
+        kf = keyframes[i]
+        h, w = [int(x) for x in kf.img_shape.flatten()[:2]]
+        X = kf.X_canon
+        if config["use_calib"]:
+            X = constrain_points_to_ray((h, w), X[None], kf.K).squeeze(0)
+        X = X.reshape(h, w, 3).cpu().numpy().astype(np.float64)
+        if use_vio:
+            world = (X * s) @ vio_R[i].T + vio_p[i]
+        else:
+            M = kf.T_WC.matrix().reshape(4, 4).cpu().numpy().astype(np.float64)
+            world = X @ M[:3, :3].T + M[:3, 3]
+        Xs.append(world.astype(np.float16))
+        confs.append(kf.get_average_conf().reshape(h, w).cpu().numpy()
+                     .astype(np.float16))
+        fids.append(int(kf.frame_id))
+    out = savedir / f"{seq_name}_kf_pointmaps.npz"
+    np.savez_compressed(out, X=np.stack(Xs), conf=np.stack(confs),
+                        frame_ids=np.asarray(fids, np.int64),
+                        coordinate="vio" if use_vio else "slam",
+                        conf_threshold=float(c_conf_threshold))
+    print(f"[pointmaps] {N} 帧点图 ({Xs[0].shape[0]}x{Xs[0].shape[1]}, "
+          f"{'米制' if use_vio else 'SLAM 尺度'}) -> {out.name}")
+
+
 def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes, start=0):
     """写关键帧图像; start>0 时只写新增部分(增量保存用, 图像入容器后不再变)。
     返回已写到的关键帧数, 供调用方作为下次 start。"""

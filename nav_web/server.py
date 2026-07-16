@@ -56,6 +56,86 @@ def raw_frame(fid):
     return send_from_directory(CFG["dataset"], f"{fid:06d}.png")
 
 
+# ---------------- HMSG 层级多模态场景图 ----------------
+_HMSG = {"pack": None, "clip": None, "lock": threading.Lock()}
+
+
+@app.route("/hmsg")
+def hmsg_page():
+    return send_from_directory(ROOT / "static", "hmsg.html")
+
+
+@app.route("/hmsg.js")
+def hmsg_js():
+    return send_from_directory(CFG["run"] / "web", "hmsg.js")
+
+
+@app.route("/api/hmsg_query", methods=["POST"])
+def hmsg_query():
+    """fast 层级检索 (照抄 fsr_vln 三级 CLIP 匹配): text -> top房间 + top物体。
+    惰性加载 query_pack.npz + OpenCLIP 文本塔。"""
+    text = (request.get_json(force=True) or {}).get("text", "").strip()
+    if not text:
+        return jsonify({"ok": False, "msg": "空查询"})
+    raw_text = text
+    if not text.isascii():          # 中文查询: Qwen 翻成英文短语再走 CLIP
+        from mast3r_slam.hmsg.qwen_zh import translate_query
+        text = translate_query(text, CFG.get("api", ""),
+                               CFG.get("model", "qwen3.5-35b-a3b"))
+        print(f"[hmsg] 查询翻译: {raw_text} -> {text}")
+    with _HMSG["lock"]:
+        if _HMSG["pack"] is None:
+            p = CFG["run"] / "hmsg" / "query_pack.npz"
+            if not p.exists():
+                return jsonify({"ok": False, "msg": "HMSG 未构建"})
+            _HMSG["pack"] = dict(np.load(p, allow_pickle=False))
+            from mast3r_slam.hmsg.features import SamClipExtractor  # noqa
+            import open_clip
+            import torch
+            from mast3r_slam.hmsg.features import CLIP_CKPT
+            m, _, _ = open_clip.create_model_and_transforms(
+                "ViT-L-14", pretrained=str(CLIP_CKPT))
+            _HMSG["clip"] = (m.to("cuda:0").eval(),
+                             open_clip.get_tokenizer("ViT-L-14"))
+            print("[hmsg] 查询包 + CLIP 文本塔已加载")
+    import torch
+    model, tok = _HMSG["clip"]
+    pk = _HMSG["pack"]
+    with torch.no_grad():
+        feats = []
+        for tpl in ("{}", "a photo of {} in the scene."):
+            f = model.encode_text(tok([tpl.format(text), tpl.format("background")]
+                                      ).to("cuda:0")).float()
+            feats.append(torch.nn.functional.normalize(f, dim=-1))
+        tf = torch.nn.functional.normalize(torch.stack(feats).mean(0),
+                                           dim=-1).cpu().numpy()
+    qf, bg = tf[0], tf[1]
+    # 房间: 各房间代表特征取 max
+    rs = {}
+    for rid, f in zip(pk["room_rep_ids"], pk["room_rep_feats"]):
+        s = float(f @ qf)
+        rs[str(rid)] = max(s, rs.get(str(rid), -1))
+    top_rooms = sorted(rs.items(), key=lambda x: -x[1])[:5]
+    cand = {r for r, _ in top_rooms}
+    objs = []
+    for i in range(len(pk["obj_ids"])):
+        if str(pk["obj_rooms"][i]) not in cand:
+            continue
+        sq, sb = float(pk["obj_feats"][i] @ qf), float(pk["obj_feats"][i] @ bg)
+        if sq <= sb:                       # 负词表过滤 (icra 版 ["background"])
+            continue
+        objs.append({"id": str(pk["obj_ids"][i]),
+                     "name": str(pk["obj_names"][i]),
+                     "room": str(pk["obj_rooms"][i]),
+                     "best_view": str(pk["obj_best_views"][i]),
+                     "score": round(sq, 4)})
+    objs.sort(key=lambda x: -x["score"])
+    return jsonify({"ok": True, "query_en": text,
+                    "rooms": [{"id": r, "score": round(s, 4)}
+                              for r, s in top_rooms],
+                    "objects": objs[:8]})
+
+
 @app.route("/api/nl_query", methods=["POST"])
 def nl_query():
     """自然语言 -> 最匹配的语义节点。body: {text: str}

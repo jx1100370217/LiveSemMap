@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>HMSG 层级多模态场景图</title>
+<style>
+:root{--bg:#0a0e18;--panel:#0f1524;--line:#1c2740;--txt:#e8eefb;--dim:#8ba0bf}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--txt);font:13px/1.5 "JetBrains Mono",monospace;overflow:hidden}
+#top{height:44px;display:flex;align-items:center;gap:14px;padding:0 16px;border-bottom:1px solid var(--line)}
+#top b{color:#4fc3f7}
+.badge{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:3px 10px;font-size:12px}
+.badge b{margin-left:6px;color:#ffd54f}
+#wrap{display:flex;height:calc(100vh - 44px)}
+#stage{flex:1;position:relative}
+#cv{width:100%;height:100%;display:block;cursor:grab}
+#side{width:400px;border-left:1px solid var(--line);background:var(--panel);overflow-y:auto;padding:14px}
+h2{font-size:13px;color:#4fc3f7;margin:12px 0 8px}
+#layers{position:absolute;top:12px;left:12px;display:flex;gap:8px}
+.lbtn{background:rgba(15,21,36,.9);border:1px solid var(--line);border-radius:8px;color:var(--dim);padding:4px 10px;font-size:12px;cursor:pointer}
+.lbtn.on{color:#fff;border-color:#4fc3f7}
+#q{width:100%;background:#0a101e;border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:8px 10px;font:12px "JetBrains Mono",monospace}
+#qbtn{margin-top:6px;width:100%;background:#16324a;border:1px solid #2a5d8a;border-radius:8px;color:#cfe8ff;padding:7px;cursor:pointer;font-size:12px}
+.tree{font-size:12px;color:var(--dim)}
+.tree .r{padding:3px 6px;border-radius:6px;cursor:pointer;display:flex;justify-content:space-between}
+.tree .r:hover,.tree .r.sel{background:#16233c;color:#fff}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}
+#detail{font-size:12px}
+#detail img{width:100%;border-radius:8px;margin-top:6px;border:1px solid var(--line)}
+.res{padding:4px 6px;border-radius:6px;cursor:pointer;font-size:12px;display:flex;justify-content:space-between}
+.res:hover{background:#16233c}
+.res b{color:#aed581}
+.hint{color:#5a6b88;font-size:11px;margin-top:4px}
+</style>
+</head>
+<body>
+<div id="top">
+  <b>HMSG</b> 层级多模态场景图
+  <span class="badge">数据集<b id="bSeq">-</b></span>
+  <span class="badge">楼层<b id="bF">0</b></span>
+  <span class="badge">房间<b id="bR">0</b></span>
+  <span class="badge">物体<b id="bO">0</b></span>
+  <span class="badge">视图<b id="bV">0</b></span>
+  <a href="/" style="margin-left:auto;color:#4fc3f7;text-decoration:none">← 导航页</a>
+</div>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="layers">
+      <button class="lbtn on" id="lyRoom">房间区域</button>
+      <button class="lbtn on" id="lyObj">物体</button>
+      <button class="lbtn" id="lyView">视图</button>
+      <button class="lbtn" id="lyEdge">共视边</button>
+    </div>
+  </div>
+  <div id="side">
+    <h2>语言查询 (fast 层级检索)</h2>
+    <input id="q" placeholder="如: 咖啡机 / 打印机 / 绿植 / 电梯">
+    <button id="qbtn">🔍 查询 HMSG</button>
+    <div id="qres"></div>
+    <h2>层级结构</h2>
+    <div class="tree" id="tree"></div>
+    <h2>选中详情</h2>
+    <div id="detail" class="hint">点击画布中的物体 / 左侧房间</div>
+  </div>
+</div>
+<script src="/hmsg.js"></script>
+<script>
+let D = window.HMSG;
+let roomById = {}, objById = {}, viewById = {};
+function buildIndex(){
+  document.getElementById('bSeq').textContent = D.seq;
+  document.getElementById('bF').textContent = D.floors.length;
+  document.getElementById('bR').textContent = D.rooms.length;
+  document.getElementById('bO').textContent = D.objects.length;
+  document.getElementById('bV').textContent = D.views.length;
+  roomById = {}; D.rooms.forEach(r => roomById[r.id] = r);
+  objById = {}; D.objects.forEach(o => objById[o.id] = o);
+  viewById = {}; D.views.forEach(v => viewById[v.id] = v);
+  document.getElementById('tree').innerHTML = D.floors.map(f => `
+  <div style="padding:2px 0"><b style="color:#ba68c8">Floor ${f.id}</b>
+  <span class="hint">z=${f.zero.toFixed(2)} h=${f.height.toFixed(2)}m</span></div>
+  ${D.rooms.filter(r => f.rooms.includes(r.id)).map(r => `
+    <div class="r" data-id="${r.id}" onclick="selectRoom('${r.id}')">
+      <span><span class="dot" style="background:${r.color}"></span>${r.name_zh || (r.id + ' ' + r.name)}</span>
+      <span>${r.n_objects}物 ${r.n_views}视</span></div>`).join('')}`).join('');
+}
+
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let W, H, view = {s: 1, cx: 0, cy: 0};
+const [x0, y0, x1, y1] = D.bounds;
+function fit(){ W = cv.clientWidth; H = cv.clientHeight;
+  cv.width = W * devicePixelRatio; cv.height = H * devicePixelRatio;
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  view.s = Math.min(W / (x1 - x0 + 2), H / (y1 - y0 + 2)) * 0.94;
+  view.cx = (x0 + x1) / 2; view.cy = (y0 + y1) / 2; }
+const T = (x, y) => [W/2 + (x - view.cx) * view.s, H/2 - (y - view.cy) * view.s];
+window.addEventListener('resize', () => { buildIndex(); fit(); draw();
+
+// 在线热更新: 建图中 OnlineHMSG 周期重写 hmsg.js, 前端 20s 轮询, 变化才重绘
+setInterval(async () => {
+  try {
+    const txt = await fetch('/hmsg.js?t=' + Date.now()).then(r => r.text());
+    const m = txt.match(/window\.HMSG = ([\s\S]*);\s*$/);
+    if (!m) return;
+    const nd = JSON.parse(m[1]);
+    if (nd.rooms.length === D.rooms.length &&
+        nd.objects.length === D.objects.length &&
+        nd.views.length === D.views.length &&
+        JSON.stringify(nd.rooms.map(r=>r.name_zh)) ===
+        JSON.stringify(D.rooms.map(r=>r.name_zh))) return;
+    D = nd; buildIndex(); draw();
+  } catch (e) {}
+}, 20000); });
+
+let show = {room: true, obj: true, view: false, edge: false};
+let sel = null;        // {type:'object'|'room', id}
+let hi = {rooms: new Set(), objs: new Set()};   // 查询高亮
+
+function draw(){
+  ctx.clearRect(0, 0, W, H);
+  if (show.room) D.rooms.forEach(r => {
+    const dimmed = hi.rooms.size && !hi.rooms.has(r.id);
+    ctx.fillStyle = r.color + (dimmed ? '30' : '85');
+    const s = Math.max(1.6, 0.05 * view.s);
+    r.pts.forEach(p => { const [sx, sy] = T(p[0], p[1]);
+      ctx.fillRect(sx - s/2, sy - s/2, s, s); });
+  });
+  if (show.room) D.rooms.forEach(r => {   // 房名标签 (区域均值处)
+    let mx = 0, my = 0; r.pts.forEach(p => { mx += p[0]; my += p[1]; });
+    const [sx, sy] = T(mx / r.pts.length, my / r.pts.length);
+    ctx.font = '700 13px "JetBrains Mono"';
+    ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(10,14,24,.9)';
+    const t = r.name_zh || `${r.id} ${r.name}`;
+    ctx.strokeText(t, sx, sy); ctx.fillStyle = '#fff'; ctx.fillText(t, sx, sy);
+  });
+  if (show.view) D.views.forEach(v => {
+    const [sx, sy] = T(v.x, v.y);
+    ctx.strokeStyle = 'rgba(45,226,230,.6)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(sx, sy, 2.5, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + v.dx * 8, sy - v.dy * 8); ctx.stroke();
+  });
+  if (show.edge && sel && sel.type === 'object'){
+    const o = objById[sel.id];
+    ctx.strokeStyle = 'rgba(120,220,140,.5)'; ctx.setLineDash([4, 4]);
+    const [ox, oy] = T(o.c[0], o.c[1]);
+    o.views.forEach(vid => { const v = viewById[vid]; if (!v) return;
+      const [vx, vy] = T(v.x, v.y);
+      ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(vx, vy); ctx.stroke(); });
+    ctx.setLineDash([]);
+  }
+  if (show.obj) D.objects.forEach(o => {
+    const dimmed = hi.objs.size && !hi.objs.has(o.id);
+    const isSel = sel && sel.type === 'object' && sel.id === o.id;
+    const [sx, sy] = T(o.c[0], o.c[1]);
+    const room = roomById[o.room];
+    ctx.fillStyle = dimmed ? 'rgba(120,130,150,.35)'
+      : (room ? room.color : '#ccc');
+    ctx.beginPath(); ctx.arc(sx, sy, isSel ? 7 : 4, 0, 7); ctx.fill();
+    ctx.strokeStyle = isSel ? '#fff' : 'rgba(255,255,255,.55)';
+    ctx.lineWidth = isSel ? 2 : 1; ctx.stroke();
+    if (isSel || hi.objs.has(o.id) || view.s > 42){
+      ctx.font = '600 11px "JetBrains Mono"';
+      ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(10,14,24,.9)';
+      const on = o.name_zh || o.name;
+      ctx.strokeText(on, sx + 8, sy - 6);
+      ctx.fillStyle = '#e8eefb'; ctx.fillText(on, sx + 8, sy - 6);
+    }
+  });
+  ctx.font = '600 11px "JetBrains Mono"'; ctx.fillStyle = '#5a6b88';
+  ctx.fillText('HMSG: Floor→Room→{Object,View} · 房间=分水岭区域 · 点=物体实例(房色) · 滚轮缩放/拖拽平移', 14, H - 10);
+}
+
+// 交互: 缩放/平移/点选
+cv.addEventListener('wheel', e => { e.preventDefault();
+  view.s *= e.deltaY < 0 ? 1.15 : 0.87; draw(); }, {passive: false});
+let drag = null;
+cv.addEventListener('mousedown', e => drag = [e.clientX, e.clientY, false]);
+window.addEventListener('mousemove', e => { if (!drag) return;
+  const dx = e.clientX - drag[0], dy = e.clientY - drag[1];
+  if (Math.abs(dx) + Math.abs(dy) > 3) drag[2] = true;
+  view.cx -= dx / view.s; view.cy += dy / view.s;
+  drag[0] = e.clientX; drag[1] = e.clientY; draw(); });
+window.addEventListener('mouseup', () => { if (drag && !drag[2]) {} drag = null; });
+cv.addEventListener('click', e => {
+  if (drag && drag[2]) return;
+  const r = cv.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  let best = null, bd = 14 * 14;
+  D.objects.forEach(o => { const [sx, sy] = T(o.c[0], o.c[1]);
+    const d = (sx - mx) ** 2 + (sy - my) ** 2;
+    if (d < bd) { bd = d; best = o; } });
+  if (best) selectObject(best.id);
+});
+
+function selectObject(id){
+  const o = objById[id];
+  if (!o) return;              // 热更新后旧 id 失效
+  sel = {type: 'object', id};
+  const room = roomById[o.room];
+  const el = document.getElementById('detail');
+  const bv = o.best_view && viewById[o.best_view];
+  el.innerHTML = `
+    <div><b style="color:#aed581">${o.name_zh || o.name}</b> <span class="hint">${o.name} · ${o.id}</span></div>
+    <div class="hint">所在区域: ${room ? (room.name_zh || room.name) : o.room} · ${o.n_pts} 点
+    · z ${o.z[0]}~${o.z[1]}m · 可见视图 ${o.views.length}</div>
+    ${bv ? `<div class="hint">best view: ${o.best_view} (帧 ${bv.img_id})</div>
+    <img src="/raw/${bv.img_id}">
+    ${bv.desc ? `<div class="hint">${bv.desc}</div>` : ''}` : ''}`;
+  draw();
+}
+function selectRoom(id){
+  const r = roomById[id];
+  if (!r) return;
+  sel = {type: 'room', id};
+  hi.rooms = new Set([id]);
+  hi.objs = new Set(D.objects.filter(o => o.room === id).map(o => o.id));
+  const objs = D.objects.filter(o => o.room === id);
+  document.getElementById('detail').innerHTML = `
+    <div><span class="dot" style="background:${r.color}"></span><b>${r.name_zh || (r.id + ' ' + r.name)}</b> <span class="hint">${r.type_zh || r.name}</span></div>
+    ${r.summary_zh ? `<div class="hint">${r.summary_zh}</div>` : ''}
+    <div class="hint">${r.n_views} 视图 · ${objs.length} 物体</div>
+    <div style="margin-top:6px">${objs.slice(0, 30).map(o =>
+      `<div class="res" onclick="selectObject('${o.id}')"><span>${o.name_zh || o.name}</span><b>${o.id}</b></div>`).join('')}</div>`;
+  document.querySelectorAll('.tree .r').forEach(n =>
+    n.classList.toggle('sel', n.dataset.id === id));
+  draw();
+}
+
+// 图层开关
+[['lyRoom','room'],['lyObj','obj'],['lyView','view'],['lyEdge','edge']].forEach(([id, k]) => {
+  document.getElementById(id).onclick = e => {
+    show[k] = !show[k]; e.target.classList.toggle('on', show[k]); draw(); };
+});
+
+// 查询
+async function doQuery(){
+  const text = document.getElementById('q').value.trim();
+  if (!text) return;
+  const el = document.getElementById('qres');
+  el.innerHTML = '<div class="hint">检索中...</div>';
+  const r = await fetch('/api/hmsg_query', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text})}).then(r => r.json());
+  if (!r.ok) { el.innerHTML = `<div class="hint">${r.msg}</div>`; return; }
+  hi.rooms = new Set(r.rooms.map(x => x.id));
+  hi.objs = new Set(r.objects.map(x => x.id));
+  const rn = id => (roomById[id] && (roomById[id].name_zh || roomById[id].name)) || id;
+  el.innerHTML = `
+    ${r.query_en && r.query_en !== text ? `<div class="hint" style="margin-top:6px">译: ${r.query_en}</div>` : ''}
+    <div class="hint" style="margin-top:6px">top 区域: ${r.rooms.map(x =>
+      `${rn(x.id)}(${x.score.toFixed(2)})`).join(' · ')}</div>
+    ${r.objects.map(o => { const ob = objById[o.id];
+      return `<div class="res" onclick="selectObject('${o.id}')">
+      <span>${(ob && ob.name_zh) || o.name} <span class="hint">${rn(o.room)}</span></span>
+      <b>${o.score.toFixed(3)}</b></div>`; }).join('')
+    || '<div class="hint">无物体命中</div>'}`;
+  if (r.objects.length) selectObject(r.objects[0].id);
+  draw();
+}
+document.getElementById('qbtn').onclick = doQuery;
+document.getElementById('q').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doQuery(); });
+
+buildIndex(); fit(); draw();
+
+// 在线热更新: 建图中 OnlineHMSG 周期重写 hmsg.js, 前端 20s 轮询, 变化才重绘
+setInterval(async () => {
+  try {
+    const txt = await fetch('/hmsg.js?t=' + Date.now()).then(r => r.text());
+    const m = txt.match(/window\.HMSG = ([\s\S]*);\s*$/);
+    if (!m) return;
+    const nd = JSON.parse(m[1]);
+    if (nd.rooms.length === D.rooms.length &&
+        nd.objects.length === D.objects.length &&
+        nd.views.length === D.views.length &&
+        JSON.stringify(nd.rooms.map(r=>r.name_zh)) ===
+        JSON.stringify(D.rooms.map(r=>r.name_zh))) return;
+    D = nd; buildIndex(); draw();
+  } catch (e) {}
+}, 20000);
+</script>
+</body>
+</html>

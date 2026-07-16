@@ -47,10 +47,12 @@ class Window(WindowEvents):
     title = "LiveSemMap"
     window_size = (3840, 2160)
 
-    def __init__(self, states, keyframes, main2viz, viz2main, semantic_ann=None, **kwargs):
+    def __init__(self, states, keyframes, main2viz, viz2main, semantic_ann=None,
+                 hmsg_live=None, **kwargs):
         super().__init__(**kwargs)
         # 语义关键帧标注 (主进程语义线程写入的 Manager.dict: kf_idx -> annotation)
         self.semantic_ann = semantic_ann
+        self.hmsg_live = hmsg_live       # OnlineHMSG 房间区域快照 (Manager dict)
         self.show_semantic = True
         self._n_sem_nodes = 0
         self.ctx.gc_mode = "auto"
@@ -433,7 +435,7 @@ class Window(WindowEvents):
         imgui.set_next_window_size(panel_w, window_size[1] - 2 * margin)
         imgui.set_next_window_position(window_size[0] - panel_w - margin, margin)
         imgui.begin("Map View", flags=imgui.WINDOW_NO_SCROLLBAR)
-        _, self.show_map = imgui.checkbox("show BEV / occupancy", self.show_map)
+        _, self.show_map = imgui.checkbox("show BEV / HMSG regions", self.show_map)
         if self.semantic_ann is not None:
             imgui.same_line()
             _, self.show_semantic = imgui.checkbox("semantic", self.show_semantic)
@@ -447,7 +449,7 @@ class Window(WindowEvents):
         sz = (side, side)
         image_with_text(self.bev_img, sz, "BEV (top-down, color)", same_line=False)
         image_with_text(
-            self.occ_img, sz, "Occupancy: dark=occ / light=free / gray=unknown", same_line=False
+            self.occ_img, sz, "HMSG regions (在线区域生长: 房色区域+中文房名)", same_line=False
         )
         imgui.end()
 
@@ -590,6 +592,14 @@ class Window(WindowEvents):
         if len(P) < 20:
             return
         bev, occ, _grid, meta = rasterize_map(P, C, centers)
+        # HMSG 在线区域生长图: 占据图上叠加当前房间区域着色 + 中文房名
+        # (数据来自 OnlineHMSG 周期快照, 建图过程中可见区域分裂/合并/命名)
+        if self.hmsg_live is not None:
+            try:
+                rooms = self.hmsg_live.get("rooms") or []
+                occ = self._paint_regions(occ, rooms, meta)
+            except Exception:
+                pass
         # 语义节点叠加: 逐关键帧标注 -> 聚合节点 -> 类别色圆点+中文名画到 BEV/占据图
         if self.semantic_ann is not None and self.show_semantic:
             try:
@@ -605,8 +615,51 @@ class Window(WindowEvents):
         with self._map_lock:
             self._map_result = (bev, occ)
 
+    @staticmethod
+    def _paint_regions(occ, rooms, meta):
+        """房间区域染色到占据图 (底图墙/未知层次保留) + 房名中文标签。"""
+        if not rooms:
+            return occ
+        from mast3r_slam.mapping2d import _get_font, world_to_px
+        G = meta["G"]
+        centers = []
+        for r in rooms:
+            pts2 = np.asarray(r["pts"], np.float64)
+            if not len(pts2):
+                centers.append(None)
+                continue
+            p3 = np.zeros((len(pts2), 3))
+            p3[:, meta["a"]] = pts2[:, 0]
+            p3[:, meta["b"]] = pts2[:, 1]
+            px, py = world_to_px(p3, meta)
+            xi, yi = np.round(px).astype(int), np.round(py).astype(int)
+            m = (xi >= 0) & (xi < G) & (yi >= 0) & (yi < G)
+            col = np.array([int(r["color"][i:i + 2], 16) / 255.0
+                            for i in (1, 3, 5)], np.float32)
+            occ[yi[m], xi[m]] = 0.35 * occ[yi[m], xi[m]] + 0.65 * col
+            centers.append((int(np.median(xi[m])), int(np.median(yi[m])))
+                           if m.any() else None)
+        # 中文房名 (PIL, 黑描边)
+        font = _get_font(max(9, G // 40))
+        if font is not None:
+            from PIL import Image as PImage
+            from PIL import ImageDraw
+            u8 = (np.clip(occ, 0, 1) * 255).astype(np.uint8)
+            pil = PImage.fromarray(u8)
+            d = ImageDraw.Draw(pil)
+            for r, c in zip(rooms, centers):
+                if c is None or not r.get("name"):
+                    continue
+                tw = d.textlength(r["name"], font=font)
+                d.text((np.clip(c[0] - tw / 2, 1, G - tw - 1),
+                        max(1, c[1] - font.size // 2)), r["name"], font=font,
+                       fill=(255, 255, 255), stroke_width=2,
+                       stroke_fill=(10, 12, 20))
+            occ = pil_to_float = np.asarray(pil, np.float32) / 255.0
+        return occ
 
-def run_visualization(cfg, states, keyframes, main2viz, viz2main, semantic_ann=None) -> None:
+
+def run_visualization(cfg, states, keyframes, main2viz, viz2main, semantic_ann=None, hmsg_live=None) -> None:
     set_global_config(cfg)
     # Ctrl-C 属于主进程的"中断并保存"流程; viewer 忽略 SIGINT, 由窗口关闭/TERMINATED 退出
     import signal
@@ -635,6 +688,7 @@ def run_visualization(cfg, states, keyframes, main2viz, viz2main, semantic_ann=N
     timer = Timer()
     window_config = config_cls(
         states=states,
+        hmsg_live=hmsg_live,
         keyframes=keyframes,
         main2viz=main2viz,
         viz2main=viz2main,
