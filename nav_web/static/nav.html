@@ -188,6 +188,8 @@
       <h2>视觉观察 <span class="r" id="fpvIdx">-</span></h2>
       <div id="fpvWrap"><img id="fpv" src="" alt=""><canvas id="fpvcv"></canvas></div>
       <div class="fpvcap"><span id="fpvSem">-</span><b id="fpvDist"></b></div>
+      <div id="surGrid" style="display:none;grid-template-columns:1fr 1fr;gap:4px;margin-top:6px"></div>
+      <div id="annDesc" style="display:none;font-size:12px;color:var(--dim);line-height:1.55;margin-top:6px"></div>
       <div id="lotisPanel" style="display:none">
         <div class="lotismsg" id="lotisMsg">规划 LoTIS 路线后, 观察帧自动打点</div>
         <div class="lotisbar"><button id="btnLotisRoute">🧭 LoTIS 路线(起→终, 抄近路)</button></div>
@@ -776,20 +778,27 @@ function renderStatic(){ octx.clearRect(0,0,W,H);
   const placed=[];
   // 语义区域名 (语义底图标注, 先占位, 节点胶囊标签避让它们)
   if(REG.length){
-    const fs=Math.min(17,Math.max(11,view.scale*5.5));
-    octx.font=`700 ${fs}px system-ui,"Noto Sans CJK SC",sans-serif`;
+    // 区域名 = 底图地名: 区域色同色系大字+字距+同色光晕, 一眼与节点胶囊区分
+    const fs=Math.min(27,Math.max(17,view.scale*9));
+    octx.font=`900 ${fs}px system-ui,"Noto Sans CJK SC",sans-serif`;
     octx.textAlign='center'; octx.textBaseline='middle';
+    if('letterSpacing' in octx) octx.letterSpacing='3px';
     const drawn=new Set();                       // 同名区域(未合并的分裂区)只标一次
     REG.forEach(r=>{ if(!r.name||drawn.has(r.name)) return;
       const[sx,sy]=p2s(r.cpx[0],r.cpx[1]);
       if(sx<-40||sx>W+40||sy<0||sy>H) return;
       drawn.add(r.name);
-      const tw=octx.measureText(r.name).width, bb=[sx-tw/2-5,sy-fs*0.7,tw+10,fs*1.4];
+      const tw=octx.measureText(r.name).width, bb=[sx-tw/2-6,sy-fs*0.8,tw+12,fs*1.6];
       if(placed.some(p=>bb[0]<p[0]+p[2]&&bb[0]+bb[2]>p[0]&&bb[1]<p[1]+p[3]&&bb[1]+bb[3]>p[1])) return;
       placed.push(bb);
-      octx.lineWidth=3.5; octx.lineJoin='round'; octx.strokeStyle='rgba(8,12,20,.8)';
+      const rc=r.rgb, lt=rc.map(v=>Math.round(v*0.28+255*0.72));   // 区域色亮化
+      octx.save();
+      octx.lineWidth=6; octx.lineJoin='round'; octx.strokeStyle='rgba(5,8,15,.95)';
       octx.strokeText(r.name,sx,sy);
-      octx.fillStyle='rgba(255,255,255,.95)'; octx.fillText(r.name,sx,sy); });
+      octx.shadowColor=`rgb(${rc[0]},${rc[1]},${rc[2]})`; octx.shadowBlur=14;  // 同色光晕
+      octx.fillStyle=`rgba(${lt[0]},${lt[1]},${lt[2]},1)`; octx.fillText(r.name,sx,sy);
+      octx.restore(); });
+    if('letterSpacing' in octx) octx.letterSpacing='0px';
     octx.textAlign='left'; octx.textBaseline='alphabetic';
   }
   D.nodes.forEach((n,i)=>{ const[sx,sy]=p2s(n.px[0],n.px[1]);
@@ -903,7 +912,10 @@ cv.addEventListener('wheel',e=>{ e.preventDefault();
 cv.addEventListener('click',e=>{ if(moved) return;
   const[px,py]=s2p(e.offsetX,e.offsetY);
   const ni=nearestNode(px,py,14/Math.min(view.scale,2));
-  if(mode==='idle'&&ni<0) return;
+  if(mode==='idle'&&ni<0){
+    const hk = hoverKf>=0? hoverKf : nearestKf(px,py,12/Math.min(view.scale,2));
+    if(hk>=0) showKfDetail(hk);
+    return; }
   const kind = mode==='pickG'?'G':'S';
   if(ni>=0){ const n=D.nodes[ni]; selectNode(ni,false);
     if(mode!=='idle'){ nodeEndpoint(kind,n); setMode('idle'); }
@@ -921,7 +933,8 @@ document.getElementById('btnPickG').onclick=()=>setMode(mode==='pickG'?'idle':'p
 document.getElementById('btnReset').onclick=()=>{ start=goal=null; path=null; robot=null; stopAnim();
   startNode=goalNode=null; lotisRoute=null; _lastLotisReq=''; stopFpvPlay(); lotisTimeline=[]; clearLotisDot(); staticDirty=true;
   document.getElementById('lotisSteps').innerHTML=''; document.getElementById('lotisRouteMsg').textContent='';
-  selNode=-1; ['sPh','gPh'].forEach((id,ix)=>document.getElementById(id).textContent=ix?'点选 / 语言':'点选 / 语言 / 图像');
+  selNode=-1; hideNodeDetail();
+  ['sPh','gPh'].forEach((id,ix)=>document.getElementById(id).textContent=ix?'点选 / 语言':'点选 / 语言 / 图像');
   document.getElementById('sName').textContent='未设置';
   document.getElementById('gName').textContent='未设置';
   document.getElementById('bPath').textContent='-';
@@ -955,7 +968,59 @@ function selectNode(i,center){ selNode=i; staticDirty=true;
     document.getElementById('fpv').src=`/thumbs/kf${n.rep_kf}.jpg`; fpvKf=n.rep_kf; clearLotisDot();
     document.getElementById('fpvIdx').textContent=`kf ${n.rep_kf} (${n.name} 代表帧)`;
     document.getElementById('fpvSem').textContent=`${n.name} · ${n.cat_zh}`;
-  } }
+  }
+  showNodeDetail(n); }
+
+// 环视 4 鱼眼网格 (节点详情 / 关键帧详情共用)
+function fillSurround(fid){
+  const sg=document.getElementById('surGrid');
+  if(fid===null||fid===undefined){ sg.style.display='none'; return; }
+  const DIRS=['前','右','后','左'];
+  sg.innerHTML=[1,2,3,4].map(k=>
+    `<div style="position:relative"><img src="/surround/${fid}/${k}" loading="lazy"`+
+    ` style="width:100%;border-radius:6px;display:block;border:1px solid var(--line)">`+
+    `<span style="position:absolute;left:4px;top:3px;font-size:10px;color:#e8eefb;`+
+    `background:rgba(9,14,24,.72);padding:1px 6px;border-radius:6px">${DIRS[k-1]}</span></div>`).join('');
+  sg.style.display='grid';
+}
+// 选中节点: 环视 4 鱼眼 + 语义标注模型对代表帧的视觉描述
+function showNodeDetail(n){
+  fillSurround(D.kf[n.rep_kf]? D.kf[n.rep_kf].fid : null);
+  const ad=document.getElementById('annDesc');
+  const parts=[`<b style="color:#e8eefb">视觉描述</b> ${n.desc||'-'}`];
+  if(n.objects&&n.objects.length) parts.push(`<b style="color:#e8eefb">可见物体</b> ${n.objects.join('、')}`);
+  if(n.signage&&n.signage.length) parts.push(`<b style="color:#e8eefb">标识牌</b> ${n.signage.join('、')}`);
+  ad.innerHTML=parts.join('<br>');
+  ad.style.display='block';
+}
+// 点击任意关键帧点: 环视 4 鱼眼 + Qwen 区域判定的空间描述 (参与区域增长的每个 node)
+function showKfDetail(k){
+  const kf=D.kf[k];
+  if(!lotisRoute){
+    document.getElementById('fpv').src=`/thumbs/kf${k}.jpg`; fpvKf=k; clearLotisDot();
+    document.getElementById('fpvIdx').textContent=`kf ${k} / frame ${kf.fid}`;
+    const reg=regionAt(kf.px[0],kf.px[1]);
+    document.getElementById('fpvSem').textContent=reg? reg.name : '-';
+    document.getElementById('fpvDist').textContent=
+      `(${(kf.px[0]*MPP).toFixed(1)}, ${(kf.px[1]*MPP).toFixed(1)})m`;
+  }
+  fillSurround(kf.fid);
+  const ad=document.getElementById('annDesc');
+  const v=D.kf_vlm? D.kf_vlm[k] : null;
+  const parts=[];
+  if(v&&v.d) parts.push(`<b style="color:#e8eefb">空间判定 (Qwen)</b> ${v.d}`);
+  else parts.push(`<b style="color:#e8eefb">空间判定 (Qwen)</b> `+
+    `(该帧未单独判定${v&&v.rn? `, 空间抽稀并入「${v.rn}」` : ''})`);
+  if(v&&v.rn) parts.push(`<b style="color:#e8eefb">所属区域</b> ${v.rn}`);
+  const a=D.kf_ann[k];
+  if(a) parts.push(`<b style="color:#e8eefb">语义标注</b> ${a.name} · ${D.categories[a.cat].zh} (${a.conf})`);
+  ad.innerHTML=parts.join('<br>');
+  ad.style.display='block';
+}
+function hideNodeDetail(){
+  document.getElementById('surGrid').style.display='none';
+  document.getElementById('annDesc').style.display='none';
+}
 
 // ---- 自然语言 ----
 async function nlQuery(kind){ const t=document.getElementById('nlText').value.trim();

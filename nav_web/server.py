@@ -56,6 +56,24 @@ def raw_frame(fid):
     return send_from_directory(CFG["dataset"], f"{fid:06d}.png")
 
 
+@app.route("/surround/<int:fid>/<int:cam>")
+def surround_frame(fid, cam):
+    """环视鱼眼缩略图 (cam 1前/2右/3后/4左), 首次访问生成 420px 宽缓存。"""
+    cache = CFG["run"] / "web" / "sur"
+    cache.mkdir(parents=True, exist_ok=True)
+    f = cache / f"{fid:06d}_{cam}.jpg"
+    if not f.exists():
+        src = CFG["dataset"] / "surround" / f"{fid:06d}_{cam}.jpg"
+        if not src.exists():
+            return "", 404
+        from PIL import Image
+        im = Image.open(src)
+        im = im.resize((420, int(im.height * 420 / im.width)),
+                       Image.BILINEAR)
+        im.convert("RGB").save(f, "JPEG", quality=82)
+    return send_from_directory(cache, f.name)
+
+
 # ---------------- HMSG 层级多模态场景图 ----------------
 _HMSG = {"pack": None, "clip": None, "lock": threading.Lock()}
 

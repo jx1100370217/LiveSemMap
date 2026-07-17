@@ -16,7 +16,6 @@ from .prompts import JUDGE_PROMPT, JUDGE_SCHEMA, NAME_PROMPT, NAME_SCHEMA
 
 VOTE_VOXEL = 0.15          # 足迹投票网格 (米)
 RETURN_CONFIRM_M = 3.0     # 回访几何确认: 相机距目标区域足迹的最大距离
-JUDGE_THIN_M = 0.4         # 空间抽稀: 距上次判定位移小于此值跳过 VLM 判定
 
 
 def _b64_img(p, half=False):
@@ -34,7 +33,8 @@ def _b64_img(p, half=False):
 
 class VLMRegionEngine:
     def __init__(self, surround_dir, dataset_dir, web_dir, seq,
-                 api_url, model, semantic_ann=None, live=None, timeout=90):
+                 api_url, model, semantic_ann=None, live=None, timeout=90,
+                 judge_thin=0.4):
         self.surround = pathlib.Path(surround_dir)
         self.ds = pathlib.Path(dataset_dir)
         self.web_dir = pathlib.Path(web_dir)
@@ -42,6 +42,7 @@ class VLMRegionEngine:
         self.api, self.model = api_url.rstrip("/"), model
         self.sem_ann = semantic_ann if semantic_ann is not None else {}
         self.live = live
+        self.judge_thin = float(judge_thin)
         self.timeout = timeout
 
         self.regions = {}          # rid -> dict
@@ -174,12 +175,13 @@ class VLMRegionEngine:
     def process_frame(self, kf_idx, fid, pose, foot2d=None):
         """顺序调用。pose: c2w(4,4); foot2d: 该帧点云 2D 足迹 (M,2) 或 None。"""
         cam_xy = np.asarray(pose[:2, 3], np.float64)
-        # 空间抽稀: 活动区域内位移不足 JUDGE_THIN_M 的帧空间身份不会变,
+        # 空间抽稀: 活动区域内位移不足 judge_thin 的帧空间身份不会变,
         # 跳过 VLM 判定, 帧与足迹照常并入活动区域 (在线 kf 多为原地旋转/
-        # 微动产生, floor1 实测可跳过 61%)
-        if self.cur is not None and self._last_judge_xy is not None \
+        # 微动产生, floor1 实测 0.4m 可跳过 61%); judge_thin=0 关闭抽稀
+        if self.judge_thin > 0 and self.cur is not None \
+                and self._last_judge_xy is not None \
                 and float(np.linalg.norm(cam_xy - self._last_judge_xy)) \
-                < JUDGE_THIN_M:
+                < self.judge_thin:
             out = None
             self.n_skip += 1
         else:
@@ -541,8 +543,23 @@ class VLMRegionEngine:
             dedup.append(e)
         self.edges = dedup
 
-    def _merge_overlapping(self, share_th=0.45):
-        """同类型 + 足迹高重叠的区域几何合并 (走廊往返两道 VLM 难判回访的兜底)。"""
+    @staticmethod
+    def _coarse_kind(k):
+        """kind -> 粗类 (通道/房间): 跨粗类的区域从不合并。"""
+        k = k or ""
+        return "corridor" if any(w in k for w in (
+            "走廊", "过道", "门厅", "前室", "电梯", "大堂", "大厅", "通道")) \
+            else "room"
+
+    def _merge_overlapping(self, share_th=0.40):
+        """来回/误切换分裂区域的几何合并兜底 (v2)。
+
+        floor28 实测教训: 命名后 type_zh 字符串比较过脆 (办公走廊 vs
+        电梯前室), 同名又可能空间不相干 (两对同名区域重叠为 0)。规则:
+        1. 时序三明治 A->B->A (B 是 A 内部的误切换碎段) + 同粗类 +
+           膨胀重叠 >= 0.25;
+        2. 生长期多数票 kind 完全相同 + 膨胀重叠 >= share_th (来/去两道)。
+        合并组的名字/类型继承帧数最多的成员。"""
         cells = {}
         with self._lock:
             for c, cnt in self.votes.items():
@@ -560,22 +577,38 @@ class VLMRegionEngine:
             for (a, b) in cs:
                 out |= {(a + i, b + j) for i in (-1, 0, 1) for j in (-1, 0, 1)}
             return out
+        # 时序切换链 -> 三明治对 (A,B,A)
+        chain = []
+        with self._lock:
+            for k in sorted(self.frames):
+                rid = self.frames[k]["rid"]
+                if not chain or chain[-1] != rid:
+                    chain.append(rid)
+        sandwich = {frozenset((chain[i - 1], chain[i]))
+                    for i in range(1, len(chain) - 1)
+                    if chain[i - 1] == chain[i + 1]}
         for i, ra in enumerate(rids):
             for rb in rids[i + 1:]:
                 A, B = cells.get(ra, set()), cells.get(rb, set())
                 if not A or not B:
                     continue
-                ka = self.regions[ra].get("type_zh") or self.regions[ra]["kind"]
-                kb = self.regions[rb].get("type_zh") or self.regions[rb]["kind"]
-                if ka != kb:
+                ka, kb = self.regions[ra]["kind"], self.regions[rb]["kind"]
+                if self._coarse_kind(ka) != self._coarse_kind(kb):
                     continue
                 inter = len(_neigh(A) & B) / min(len(A), len(B))
-                if inter > share_th:
+                hit = (frozenset((ra, rb)) in sandwich and inter >= 0.25) \
+                    or (ka == kb and inter >= share_th)
+                if hit:
                     parent[find(rb)] = find(ra)
         groups = {}
         for r in rids:
             groups.setdefault(find(r), []).append(r)
         for root, members in groups.items():
+            if len(members) > 1:      # 名字/类型继承帧数最多的成员
+                best = max(members, key=lambda m: len(self.regions[m]["frames"]))
+                for f in ("kind", "name", "type_zh", "summary", "name_summary"):
+                    if self.regions[best].get(f):
+                        self.regions[root][f] = self.regions[best][f]
             for m in members:
                 if m == root:
                     continue
@@ -622,10 +655,13 @@ class VLMRegionEngine:
             "regions": [{**{k: v for k, v in r.items()
                             if k not in ("kinds",)},
                          "frames": [int(x) for x in r["frames"]],
-                         "cells": np.round(cells.get(r["id"], np.zeros((0, 2)))
-                                           [::2], 2).tolist()}
+                         "cells": np.round(cells.get(r["id"],
+                                           np.zeros((0, 2))), 2).tolist()}
                         for r in self.regions.values()],
             "edges": self.edges,
+            "frames": {str(k): {"fid": m["fid"], "rid": m["rid"],
+                                "desc": m.get("desc", "")}
+                       for k, m in sorted(self.frames.items())},
             "frame_rid": {int(k): m["rid"] for k, m in self.frames.items()},
         }
         (sd / f"{self.seq}_vlm_regions.json").write_text(

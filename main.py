@@ -197,7 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default=rc.get("dataset", "datasets/cfds_floor28"))
     parser.add_argument("--config", default=rc.get("config", "config/cfds_floor28.yaml"))
     parser.add_argument("--save-as", default=rc.get("save_as", "default"))
-    parser.add_argument("--no-viz", default=False)
+    parser.add_argument("--no-viz", default=True)
     parser.add_argument("--calib", default=rc.get("calib", ""))
     parser.add_argument("--vio", default=rc.get("vio", ""),
                         help="方案B: VIO 度量轨迹(vio.txt, 同目录需 timestamps.txt), 给跟踪做运动补偿位姿先验; "
@@ -208,6 +208,9 @@ if __name__ == "__main__":
                         default=rc.get("semantic_api", "http://192.168.50.72:8299/v1"),
                         help="语义标注 vLLM 服务地址; 空串=关闭语义标注")
     parser.add_argument("--semantic-model", default=rc.get("semantic_model", "qwen3.5-35b-a3b"))
+    parser.add_argument("--judge-thin", type=float,
+                        default=rc.get("judge_thin", 0.4),
+                        help="VLM 区域判定空间抽稀阈值(米); 0=每关键帧都判")
     parser.add_argument("--semantic-thin", type=float,
                         default=rc.get("semantic_thin", 0.4),
                         help="语义标注空间抽稀: 距上一提交关键帧 VIO 位移<该值(米)则跳过标注; "
@@ -282,10 +285,12 @@ if __name__ == "__main__":
                 online_hmsg = VLMRegionEngine(
                     surround_dir, args.dataset, _sd / "web", _sn,
                     args.semantic_api, args.semantic_model,
-                    semantic_ann=semantic_ann, live=hmsg_live)
+                    semantic_ann=semantic_ann, live=hmsg_live,
+                    judge_thin=args.judge_thin)
                 online_hmsg.start_online(keyframes, vio_prior)
-                print("[vlm-region] VLM 区域生长引擎已启用 "
-                      "(每关键帧空间判定, viewer/web 实时区域生长)")
+                print(f"[vlm-region] VLM 区域生长引擎已启用 "
+                      f"(判定抽稀 {args.judge_thin}m, "
+                      f"viewer/web 实时区域生长)")
             else:
                 print("[vlm-region] 无 VIO, 区域引擎关闭")
         else:

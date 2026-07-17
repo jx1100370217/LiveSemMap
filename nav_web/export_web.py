@@ -62,12 +62,15 @@ def main():
     nodes = []
     for i, n in enumerate(sem["nodes"]):
         cn, color, _ = SEMANTIC_CATEGORIES.get(n["category"], ("?", (.8, .8, .8), False))
+        rep_ann = sem.get("annotations", {}).get(str(n["rep_kf"]), {})
         nodes.append({
             "id": i, "category": n["category"], "cat_zh": cn,
             "name": n["name"], "desc": n["description"],
             "conf": round(n["confidence"], 2),
             "px": to_px(np.asarray(n["position"])),
             "rep_kf": n["rep_kf"], "kfs": n["kf_indices"],
+            "objects": (rep_ann.get("objects") or [])[:8],
+            "signage": [s for s in (rep_ann.get("signage") or []) if s][:4],
             "color": "#%02x%02x%02x" % tuple(int(c * 255) for c in color),
         })
 
@@ -132,7 +135,7 @@ def main():
         for i in range(len(regions)):      # 0.15m 网格点 -> 补洞成面 + 去噪碎片
             mk = (lab == i).astype(np.uint8)
             mk = _cv.morphologyEx(mk, _cv.MORPH_CLOSE,
-                                  np.ones((3, 3), np.uint8))
+                                  np.ones((5, 5), np.uint8))
             # 玻璃反射等噪声足迹呈孤立小块: 保最大连通块 + 面积>=1.5m^2 的块
             n, cc, st, _ = _cv.connectedComponentsWithStats(mk, 8)
             if n > 2:
@@ -148,6 +151,28 @@ def main():
                        for row in lab]
         regions_js = {"regions": regions, "rows": region_rows}
         print(f"[export_web] 语义区域底图: {len(regions)} 区域")
+
+    # 每个关键帧的 VLM 区域判定描述 (点击 kf 点显示 Qwen 空间描述)
+    kf_vlm = {}
+    rid2name = {}
+    if vr.exists():
+        vj2 = json.loads(vr.read_text())
+        rid2name = {r["id"]: (r.get("name") or r.get("kind") or "")
+                    for r in vj2.get("regions", [])}
+        for k, m in vj2.get("frames", {}).items():
+            kf_vlm[int(k)] = {"d": (m.get("desc") or "")[:90],
+                              "rn": rid2name.get(m.get("rid"), "")}
+    if not kf_vlm and hj.exists():
+        # 兼容旧产物: hmsg.js views 携带帧级判定描述 (img_id=fid)
+        hd2 = json.loads(hj.read_text()[len("window.HMSG = "):-1])
+        rn2 = {r["id"]: (r.get("name_zh") or r.get("name") or "")
+               for r in hd2.get("rooms", [])}
+        fid2kf = {int(f): i for i, f in enumerate(frame_ids)}
+        for v in hd2.get("views", []):
+            k = fid2kf.get(int(v["img_id"]))
+            if k is not None:
+                kf_vlm[k] = {"d": (v.get("desc") or "")[:90],
+                             "rn": rn2.get(v.get("room"), "")}
 
     # 每个关键帧的标注摘要 (FPV 面板显示当前位置语义)
     kf_ann = {}
@@ -234,6 +259,7 @@ def main():
                 **({"dir": d} if d else {})}
                for (x, y), f, d in zip(kf_px, frame_ids, kf_dir)],
         "kf_ann": kf_ann,
+        "kf_vlm": kf_vlm,
         "nodes": nodes,
         "semregions": regions_js,        # 语义区域底图层 (null=无)
         "categories": {k: {"zh": v[0],

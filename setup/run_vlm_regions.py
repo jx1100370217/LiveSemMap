@@ -25,6 +25,9 @@ def main():
     ap.add_argument("--model", default=rc.get("semantic_model",
                                               "qwen3.5-35b-a3b"))
     ap.add_argument("--thin", type=float, default=0.6, help="抽稀间距(米)")
+    ap.add_argument("--judge-thin", type=float,
+                    default=rc.get("judge_thin", 0.4),
+                    help="VLM 判定空间抽稀阈值(米); 0=每帧都判")
     ap.add_argument("--max-frames", type=int, default=0)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
@@ -64,7 +67,7 @@ def main():
 
     from mast3r_slam.vlm_region import VLMRegionEngine
     eng = VLMRegionEngine(ds / "surround", ds, out / "web", seq,
-                          args.api, args.model)
+                          args.api, args.model, judge_thin=args.judge_thin)
     t0 = time.time()
     for n, i in enumerate(sel):
         eng.process_frame(kf_idx=i, fid=i, pose=poses[i])
