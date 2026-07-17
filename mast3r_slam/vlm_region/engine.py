@@ -161,6 +161,8 @@ class VLMRegionEngine:
             r["name_summary"] = out["summary"]
             print(f"[vlm-region] 命名 R{rid}: {out['name']} "
                   f"[{out['room_type']}]", flush=True)
+            if self.live is not None:      # 名字上图: 立即刷新 live 语义地图
+                self._push_live()
         except Exception as e:
             r["named"] = False
             print(f"[vlm-region] R{rid} 命名失败: {e}", flush=True)
@@ -350,16 +352,129 @@ class VLMRegionEngine:
         return rooms
 
     def _push_live(self):
+        """渲染当前语义地图 (与导航 Web 同观感) 推给 viewer 直接贴图显示。"""
         try:
-            rooms = self._room_structs()
-            self.live["rooms"] = [
-                {"name": r["name_zh"] or r["type_zh"], "color": r["color"],
-                 "pts": np.round(r["vertices"]
-                                 [::max(1, len(r["vertices"]) // 800)],
-                                 2).tolist()}
-                for r in rooms]
+            img = self._render_live_map()
+            if img is not None:
+                self.live["map"] = img                      # uint8 (G,G,3)
+                self.live["map_v"] = int(self.live.get("map_v", 0)) + 1
         except Exception as e:
             print(f"[vlm-region] live 推送失败: {e}", flush=True)
+
+    def _render_live_map(self, px_max=520):
+        """在线语义地图渲染: 暗底 + 区域实色块/深描边 + 关键帧白点 +
+        区域中文名 + 语义 POI 节点。世界系俯视, 包围盒自适应增长。"""
+        from PIL import Image as PImage
+        from PIL import ImageDraw
+
+        from mast3r_slam.hmsg.graph import ROOM_PALETTE
+        from mast3r_slam.mapping2d import _get_font
+        cells = self.region_cells()
+        with self._lock:
+            kf_xy = np.array([m["xy"] for m in self.frames.values()],
+                             np.float64).reshape(-1, 2)
+            order = sorted(self.regions)
+            names = [self.regions[r].get("name")
+                     or self.regions[r]["kind"] for r in order]
+        pts_all = [v for v in cells.values() if len(v)]
+        if len(kf_xy):
+            pts_all.append(kf_xy)
+        if not pts_all:
+            return None
+        P = np.concatenate(pts_all, 0)
+        lo = P.min(0) - 1.5
+        span = float(max((P.max(0) - lo).max(), 3.0)) + 1.5
+        res = max(VOTE_VOXEL, span / px_max)    # 0.15m 投票格; 超大场景再放粗
+        G0 = int(np.ceil(span / res)) + 1
+        up = max(1, round(px_max / G0))         # 整数倍 NEAREST 放大 -> 字/点清晰
+        G = G0 * up
+
+        def to_px(p):
+            q = (np.asarray(p, np.float64).reshape(-1, 2) - lo) / res
+            return q[:, 0] * up, (G0 - 1 - q[:, 1]) * up   # y 翻转 (图像行向下)
+
+        lab = np.full((G0, G0), -1, np.int16)
+        colors = []
+        for i, rid in enumerate(order):
+            col = ROOM_PALETTE[i % len(ROOM_PALETTE)]
+            colors.append([int(col[j:j + 2], 16) for j in (1, 3, 5)])
+            v = cells.get(rid)
+            if v is None or not len(v):
+                continue
+            q = (np.asarray(v, np.float64) - lo) / res
+            xi = np.round(q[:, 0]).astype(int)
+            yi = np.round(G0 - 1 - q[:, 1]).astype(int)
+            ok = (xi >= 0) & (xi < G0) & (yi >= 0) & (yi < G0)
+            lab[yi[ok], xi[ok]] = i
+        bg = np.array([13, 17, 26], np.float32)
+        img = np.tile(bg, (G0, G0, 1))
+        inner = lab >= 0
+        edge = np.zeros((G0, G0), bool)              # 区域边界 (4邻不同) 深描边
+        edge[1:] |= inner[1:] & (lab[1:] != lab[:-1])
+        edge[:-1] |= inner[:-1] & (lab[:-1] != lab[1:])
+        edge[:, 1:] |= inner[:, 1:] & (lab[:, 1:] != lab[:, :-1])
+        edge[:, :-1] |= inner[:, :-1] & (lab[:, :-1] != lab[:, 1:])
+        carr = np.asarray(colors, np.float32).reshape(-1, 3)
+        if inner.any():
+            img[inner] = carr[lab[inner]] * 0.8 + bg * 0.2
+            img[edge] = carr[lab[edge]] * 0.5
+        u8 = img.astype(np.uint8).repeat(up, 0).repeat(up, 1)
+        pil = PImage.fromarray(u8)
+        d = ImageDraw.Draw(pil)
+        if len(kf_xy):                               # 关键帧落点 (白点)
+            xs, ys = to_px(kf_xy)
+            kr = max(1.3, 0.85 * up)
+            for x, y in zip(xs, ys):
+                d.ellipse([x - kr, y - kr, x + kr, y + kr],
+                          fill=(232, 238, 248), outline=(15, 20, 30))
+        # 语义 POI 节点: 类别色圆点 + 名字
+        try:
+            from mast3r_slam.semantic import (SEMANTIC_CATEGORIES,
+                                              aggregate_nodes)
+            with self._lock:
+                pos = {k: (float(m["xy"][0]), float(m["xy"][1]), 0.0)
+                       for k, m in self.frames.items()}
+            nodes = aggregate_nodes(dict(self.sem_ann), pos)
+        except Exception:
+            nodes = []
+        sfont = _get_font(max(9, G // 52))
+        for n in nodes:
+            _, c, _ = SEMANTIC_CATEGORIES.get(n["category"],
+                                              ("?", (.8, .8, .8), False))
+            rgb = tuple(int(v * 255) for v in c)
+            x, y = to_px(np.asarray(n["position"][:2]))
+            x, y = float(x[0]), float(y[0])
+            d.ellipse([x - 3, y - 3, x + 3, y + 3], fill=rgb,
+                      outline=(255, 255, 255))
+            if sfont is not None and n.get("name"):
+                d.text((x + 5, y - sfont.size / 2), n["name"], font=sfont,
+                       fill=(232, 238, 248), stroke_width=2,
+                       stroke_fill=(10, 14, 22))
+        # 区域中文名 (同名只标一次, 已放置标签简单避让)
+        font = _get_font(max(11, G // 36))
+        if font is not None:
+            placed, drawn = [], set()
+            for i, rid in enumerate(order):
+                nm = names[i]
+                if not nm or nm in drawn:
+                    continue
+                ys_, xs_ = np.nonzero(lab == i)
+                if not len(xs_):
+                    continue
+                cx = float(np.median(xs_)) * up
+                cy = float(np.median(ys_)) * up
+                tw = d.textlength(nm, font=font)
+                box = (cx - tw / 2, cy - font.size / 2, tw, font.size * 1.2)
+                if any(box[0] < p[0] + p[2] and box[0] + box[2] > p[0]
+                       and box[1] < p[1] + p[3] and box[1] + box[3] > p[1]
+                       for p in placed):
+                    continue
+                placed.append(box)
+                drawn.add(nm)
+                d.text((np.clip(box[0], 1, G - tw - 1), max(1, box[1])), nm,
+                       font=font, fill=(255, 255, 255), stroke_width=2,
+                       stroke_fill=(10, 12, 20))
+        return np.asarray(pil)
 
     def _export_web(self):
         from mast3r_slam.hmsg.webexport import export_web_data

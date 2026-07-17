@@ -1,5 +1,4 @@
 import dataclasses
-import threading
 import time as _time
 import weakref
 from pathlib import Path
@@ -22,8 +21,6 @@ from moderngl_window.timers.clock import Timer
 
 from mast3r_slam.frame import Mode
 from mast3r_slam.geometry import get_pixel_coords
-from mast3r_slam.mapping2d import rasterize_map, draw_semantic_nodes
-from mast3r_slam.semantic import aggregate_nodes
 from mast3r_slam.lietorch_utils import as_SE3
 from mast3r_slam.visualization_utils import (
     Frustums,
@@ -53,8 +50,6 @@ class Window(WindowEvents):
         # 语义关键帧标注 (主进程语义线程写入的 Manager.dict: kf_idx -> annotation)
         self.semantic_ann = semantic_ann
         self.hmsg_live = hmsg_live       # OnlineHMSG 房间区域快照 (Manager dict)
-        self.show_semantic = True
-        self._n_sem_nodes = 0
         self.ctx.gc_mode = "auto"
         # bit hacky, but detect whether user is using 4k monitor
         self.scale = 1.0
@@ -103,12 +98,11 @@ class Window(WindowEvents):
         self.curr_img, self.kf_img = Image(), Image()
         self.curr_img_np, self.kf_img_np = None, None
 
-        # BEV 俯瞰图 + 占据栅格图 面板 (从关键帧点云实时栅格化, 节流更新)
-        self.bev_img, self.occ_img = Image(), Image()
-        self.bev_img.write(np.zeros((8, 8, 3), np.float32))
-        self.occ_img.write(np.zeros((8, 8, 3), np.float32))
-        self.show_map = True
-        self._map_cache = {}  # frame_id -> (抽样相机系点, 色, conf); 只传一次, 避免每次全量 GPU->CPU
+        # Map View 面板: 只显示 VLM 区域生长语义地图 (SLAM 进程 engine 渲染好
+        # 的 RGB 图经 hmsg_live 推来, viewer 零计算零几何 —— BEV/占据图已退役)
+        self.map_img = Image()
+        self.map_img.write(np.zeros((8, 8, 3), np.float32))
+        self._map_v = -1                 # live 地图版本号 (变了才重传纹理)
         self._last_reset = 0  # 重新建图: 检测到 states.reset_count 变化就清纹理/地图缓存(frame_id 会复用)
         # VIO 位姿渲染(仅 --vio): viewer 用 VIO 位姿画每个关键帧 -> 显示无漂移地图(单目位姿会漂)
         self.vio = None
@@ -119,12 +113,6 @@ class Window(WindowEvents):
         if _vio_path:
             from mast3r_slam.vio_prior import VIOPrior
             self.vio = VIOPrior(_vio_path, config["dataset"]["subsample"], "cpu")
-        # 地图(BEV/占据)计算放后台线程, 渲染线程只做纹理上传, 不卡渲染
-        self._map_result = None
-        self._map_lock = threading.Lock()
-        self._map_stop = False
-        self._map_thread = threading.Thread(target=self._map_worker, daemon=True)
-        self._map_thread.start()
 
         self.main2viz = main2viz
         self.viz2main = viz2main
@@ -164,11 +152,9 @@ class Window(WindowEvents):
         r = self.states.get_reset()
         if r != self._last_reset:  # 重新建图: 清纹理/地图缓存(frame_id 会从0复用, 否则显示旧帧)
             self.textures.clear()
-            self._map_cache.clear()
             self._vio_cache.clear()
             self._vio_render_cache = None
-            with self._map_lock:
-                self._map_result = None
+            self._map_v = -1
             self._last_reset = r
         self.viewport.use()
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -430,27 +416,17 @@ class Window(WindowEvents):
 
         imgui.end()
 
-        # BEV 俯瞰图 + 占据栅格图 面板 (右侧一整列; 每帧按窗口重新布局, 两图竖排铺满, 禁滚动条)
+        # 语义地图面板 (右侧一整列): VLM 区域生长的在线语义地图, 与导航 Web 同观感
         panel_w = window_size[0] * 0.30
         imgui.set_next_window_size(panel_w, window_size[1] - 2 * margin)
         imgui.set_next_window_position(window_size[0] - panel_w - margin, margin)
         imgui.begin("Map View", flags=imgui.WINDOW_NO_SCROLLBAR)
-        _, self.show_map = imgui.checkbox("show BEV / HMSG regions", self.show_map)
         if self.semantic_ann is not None:
-            imgui.same_line()
-            _, self.show_semantic = imgui.checkbox("semantic", self.show_semantic)
-            imgui.text_ansi(
-                f"semantic: {len(self.semantic_ann)} kf annotated, "
-                f"{self._n_sem_nodes} nodes"
-            )
+            imgui.text_ansi(f"semantic: {len(self.semantic_ann)} kf annotated")
         avail = imgui.get_content_region_available()
-        # 两张方图竖排全部塞进剩余高度: 边长取 宽 与 半高 的较小值 -> 不溢出=无滚动条
-        side = max(16.0, min(avail[0], (avail[1] - 12.0 * self.scale) / 2.0))
-        sz = (side, side)
-        image_with_text(self.bev_img, sz, "BEV (top-down, color)", same_line=False)
-        image_with_text(
-            self.occ_img, sz, "HMSG regions (在线区域生长: 房色区域+中文房名)", same_line=False
-        )
+        side = max(16.0, min(avail[0], avail[1] - 30.0 * self.scale))
+        image_with_text(self.map_img, (side, side),
+                        "semantic regions (live)", same_line=False)
         imgui.end()
 
         if new_state != self.state:
@@ -514,149 +490,21 @@ class Window(WindowEvents):
 
         return frame.X_canon.cpu().numpy().astype(np.float32)
 
-    def _map_worker(self):
-        """后台线程: 周期计算 BEV/占据栅格 (numpy/torch 计算释放 GIL, 与渲染线程并行, 不卡渲染)。"""
-        while not self._map_stop:
-            if self.show_map:
-                try:
-                    self._compute_map()
-                except Exception:
-                    pass
-            _time.sleep(0.4)
-
     def _upload_map(self):
-        """渲染线程: 仅把后台算好的图上传纹理 (GL 操作须在渲染线程, 极快)。"""
-        with self._map_lock:
-            r = self._map_result
-            self._map_result = None
-        if r is not None:
-            self.bev_img.write(r[0])
-            self.occ_img.write(r[1])
-
-    @torch.no_grad()  # 同 render: 跳过 autograd, lietorch 位姿->矩阵运算大幅加速
-    def _compute_map(self):
-        """BEV 彩色俯瞰 + 占据栅格。防卡顿: 每个关键帧的(抽样)相机系点/色/conf 只在首次出现时传一次
-        并缓存; 每次只批量取一次位姿, 纯 numpy 重投影(位姿变、相机系点不变); 锁内只做极短的取位姿+缓存新帧。"""
-        s = 6
-        thr = self.state.C_conf_threshold
-        calib = config["use_calib"]
-        with self.keyframes.lock:
-            N = len(self.keyframes)
-            if N == 0:
-                return
-            # 批量取全部关键帧位姿 (一次 GPU->CPU)
-            Ts = lietorch.Sim3(self.keyframes.T_WC[:N, 0]).matrix().cpu().numpy().astype(np.float32)
-            fids, dP = [], None
-            for i in range(N):
-                kf = self.keyframes[i]
-                fid = int(kf.frame_id)
-                fids.append(fid)
-                if fid in self._map_cache and i < N - 2:  # 末两帧仍在精化, 每次刷新
-                    continue
-                h, w = int(kf.img_shape.flatten()[0]), int(kf.img_shape.flatten()[1])
-                Xc = kf.X_canon.reshape(h, w, 3)[::s, ::s]
-                if calib:
-                    if self.dP_dz is None:
-                        self.frame_X(kf)
-                    if dP is None:
-                        dP = torch.from_numpy(self.dP_dz).to(Xc.device).reshape(h, w, 3)[::s, ::s]
-                    cam = (Xc[..., 2:3] * dP).reshape(-1, 3)
-                else:
-                    cam = Xc.reshape(-1, 3)
-                col = kf.uimg.reshape(h, w, 3)[::s, ::s].reshape(-1, 3)
-                conf = kf.get_average_conf().reshape(h, w)[::s, ::s].reshape(-1)
-                self._map_cache[fid] = (
-                    cam.cpu().numpy().astype(np.float32),
-                    np.clip(col.cpu().numpy().astype(np.float32), 0.0, 1.0),
-                    conf.cpu().numpy().astype(np.float32),
-                )
-        # 锁外: 纯 numpy 重投影 + 栅格化
-        if self.vio is not None:  # VIO 位姿: BEV/占据也用 VIO 位姿摆放 -> 无漂移
-            vio_data = self._vio_pose_data(np.array(fids), Ts[:, :3, 3])
-            Ts = lietorch.Sim3(vio_data.reshape(-1, 8)).matrix().numpy().astype(np.float32)
-        pts, cols, centers = [], [], []
-        for i in range(N):
-            cam, col, conf = self._map_cache[fids[i]]
-            M = Ts[i]
-            pW = cam @ M[:3, :3].T + M[:3, 3]   # Sim3(sR)·cam + t
-            m = conf > thr
-            pts.append(pW[m])
-            cols.append(col[m])
-            centers.append(M[:3, 3])
-        P = np.concatenate(pts, 0)
-        C = np.concatenate(cols, 0)
-        centers_all = np.asarray(centers, np.float32)  # 与 kf_idx 对齐 (语义节点定位用)
-        centers = centers_all[np.isfinite(centers_all).all(1)]
-        ok = np.isfinite(P).all(1) & (np.abs(P) < 1e4).all(1)
-        P, C = P[ok], C[ok]
-        if len(P) < 20:
+        """渲染线程: live 语义地图版本变化时上传纹理 (engine 已渲染好, 仅贴图)。"""
+        if self.hmsg_live is None:
             return
-        bev, occ, _grid, meta = rasterize_map(P, C, centers)
-        # HMSG 在线区域生长图: 占据图上叠加当前房间区域着色 + 中文房名
-        # (数据来自 OnlineHMSG 周期快照, 建图过程中可见区域分裂/合并/命名)
-        if self.hmsg_live is not None:
-            try:
-                rooms = self.hmsg_live.get("rooms") or []
-                occ = self._paint_regions(occ, rooms, meta)
-            except Exception:
-                pass
-        # 语义节点叠加: 逐关键帧标注 -> 聚合节点 -> 类别色圆点+中文名画到 BEV/占据图
-        if self.semantic_ann is not None and self.show_semantic:
-            try:
-                ann = dict(self.semantic_ann)
-                pos = {i: centers_all[i] for i in range(N)
-                       if np.isfinite(centers_all[i]).all()}
-                nodes = aggregate_nodes(ann, pos)
-                self._n_sem_nodes = len(nodes)
-                draw_semantic_nodes(bev, nodes, meta)
-                draw_semantic_nodes(occ, nodes, meta, label=False)
-            except Exception:
-                pass
-        with self._map_lock:
-            self._map_result = (bev, occ)
-
-    @staticmethod
-    def _paint_regions(occ, rooms, meta):
-        """房间区域染色到占据图 (底图墙/未知层次保留) + 房名中文标签。"""
-        if not rooms:
-            return occ
-        from mast3r_slam.mapping2d import _get_font, world_to_px
-        G = meta["G"]
-        centers = []
-        for r in rooms:
-            pts2 = np.asarray(r["pts"], np.float64)
-            if not len(pts2):
-                centers.append(None)
-                continue
-            p3 = np.zeros((len(pts2), 3))
-            p3[:, meta["a"]] = pts2[:, 0]
-            p3[:, meta["b"]] = pts2[:, 1]
-            px, py = world_to_px(p3, meta)
-            xi, yi = np.round(px).astype(int), np.round(py).astype(int)
-            m = (xi >= 0) & (xi < G) & (yi >= 0) & (yi < G)
-            col = np.array([int(r["color"][i:i + 2], 16) / 255.0
-                            for i in (1, 3, 5)], np.float32)
-            occ[yi[m], xi[m]] = 0.35 * occ[yi[m], xi[m]] + 0.65 * col
-            centers.append((int(np.median(xi[m])), int(np.median(yi[m])))
-                           if m.any() else None)
-        # 中文房名 (PIL, 黑描边)
-        font = _get_font(max(9, G // 40))
-        if font is not None:
-            from PIL import Image as PImage
-            from PIL import ImageDraw
-            u8 = (np.clip(occ, 0, 1) * 255).astype(np.uint8)
-            pil = PImage.fromarray(u8)
-            d = ImageDraw.Draw(pil)
-            for r, c in zip(rooms, centers):
-                if c is None or not r.get("name"):
-                    continue
-                tw = d.textlength(r["name"], font=font)
-                d.text((np.clip(c[0] - tw / 2, 1, G - tw - 1),
-                        max(1, c[1] - font.size // 2)), r["name"], font=font,
-                       fill=(255, 255, 255), stroke_width=2,
-                       stroke_fill=(10, 12, 20))
-            occ = pil_to_float = np.asarray(pil, np.float32) / 255.0
-        return occ
+        try:
+            v = self.hmsg_live.get("map_v", 0)
+            if v == self._map_v:
+                return
+            m = self.hmsg_live.get("map")
+            if m is None:
+                return
+            self._map_v = v
+            self.map_img.write(np.ascontiguousarray(m, np.float32) / 255.0)
+        except Exception:
+            pass
 
 
 def run_visualization(cfg, states, keyframes, main2viz, viz2main, semantic_ann=None, hmsg_live=None) -> None:
@@ -724,7 +572,6 @@ def run_visualization(cfg, states, keyframes, main2viz, viz2main, semantic_ann=N
             window.swap_buffers()
 
     state = window_config.state
-    window_config._map_stop = True   # 停止后台地图线程
     window.destroy()
     state.is_terminated = True
     viz2main.put(state)
