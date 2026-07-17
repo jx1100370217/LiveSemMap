@@ -489,10 +489,13 @@ class VLMRegionEngine:
                 self._name_region(rid)
         self._export_web()
         sd = pathlib.Path(save_dir)
+        cells = self.region_cells()
         out = {
             "regions": [{**{k: v for k, v in r.items()
                             if k not in ("kinds",)},
-                         "frames": [int(x) for x in r["frames"]]}
+                         "frames": [int(x) for x in r["frames"]],
+                         "cells": np.round(cells.get(r["id"], np.zeros((0, 2)))
+                                           [::2], 2).tolist()}
                         for r in self.regions.values()],
             "edges": self.edges,
             "frame_rid": {int(k): m["rid"] for k, m in self.frames.items()},

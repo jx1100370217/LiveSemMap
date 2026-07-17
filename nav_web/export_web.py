@@ -71,6 +71,84 @@ def main():
             "color": "#%02x%02x%02x" % tuple(int(c * 255) for c in color),
         })
 
+    # 语义区域底图层 (VLM 区域生长): 区域格子归属行字符串 + 区域表 ——
+    # 导航页底图由几何占据图换成语义区域图
+    regions_js, region_rows = None, None
+    vr = run / f"{args.seq}_vlm_regions.json"
+    hj = run / "web" / "hmsg.js"
+    cells_by = {}      # 区域顺序键 -> {name, (N,2) 原始系米制点}
+    if vr.exists():
+        vj = json.loads(vr.read_text())
+        for r in vj.get("regions", []):
+            if r.get("cells"):
+                nm = r.get("name") or r.get("kind") or ""
+                cells_by[str(r["id"])] = (nm, np.asarray(r["cells"]))
+    if not cells_by and hj.exists():
+        # 兼容旧产物: hmsg.js 的区域点是轴对齐旋转系, 用 kf 轨迹 Procrustes
+        # 恢复旋转(严格线性), 逆变换回原始 VIO 系
+        hd = json.loads(hj.read_text()[len("window.HMSG = "):-1])
+        fid2raw = {int(f): kf_pos[i][[a, b]]
+                   for i, f in enumerate(frame_ids)}
+        A, B = [], []
+        for v in hd.get("views", []):
+            if int(v["img_id"]) in fid2raw:
+                A.append([v["x"], v["y"]])
+                B.append(fid2raw[int(v["img_id"])])
+        if len(A) >= 8:
+            A, B = np.asarray(A, np.float64), np.asarray(B, np.float64)
+            ca, cb = A.mean(0), B.mean(0)
+            U, _, Vt = np.linalg.svd((A - ca).T @ (B - cb))
+            Rm = (U @ Vt).T
+            if np.linalg.det(Rm) < 0:
+                U[:, -1] *= -1
+                Rm = (U @ Vt).T
+            for r in hd.get("rooms", []):
+                pts = np.asarray(r["pts"], np.float64)
+                cells_by[r["id"]] = (r.get("name_zh") or r.get("name") or "",
+                                     (pts - ca) @ Rm.T + cb)
+    if cells_by:
+        from mast3r_slam.hmsg.graph import ROOM_PALETTE
+        digits = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        lab = np.full((G, G), -1, np.int16)
+        regions = []
+        for i, (rid, (nm, pts)) in enumerate(cells_by.items()):
+            if i >= len(digits) or not len(pts):
+                continue
+            p3 = np.zeros((len(pts), 3))
+            p3[:, a] = pts[:, 0]
+            p3[:, b] = pts[:, 1]
+            px = (p3[:, a] - (meta["ca"] - half)) / (2 * half) * G
+            py = G - 1 - (p3[:, b] - (meta["cb"] - half)) / (2 * half) * G
+            xi, yi = np.round(px).astype(int), np.round(py).astype(int)
+            ok = (xi >= 0) & (xi < G) & (yi >= 0) & (yi < G)
+            lab[yi[ok], xi[ok]] = i
+            cx, cy = (float(np.median(px[ok])), float(np.median(py[ok]))) \
+                if ok.any() else (0.0, 0.0)
+            regions.append({"id": rid, "name": nm,
+                            "color": ROOM_PALETTE[i % len(ROOM_PALETTE)],
+                            "cpx": [round(cx, 1), round(cy, 1)]})
+        import cv2 as _cv
+        masks = []
+        for i in range(len(regions)):      # 0.15m 网格点 -> 补洞成面 + 去噪碎片
+            mk = (lab == i).astype(np.uint8)
+            mk = _cv.morphologyEx(mk, _cv.MORPH_CLOSE,
+                                  np.ones((3, 3), np.uint8))
+            # 玻璃反射等噪声足迹呈孤立小块: 保最大连通块 + 面积>=1.5m^2 的块
+            n, cc, st, _ = _cv.connectedComponentsWithStats(mk, 8)
+            if n > 2:
+                areas = st[1:, _cv.CC_STAT_AREA]
+                keep = {int(np.argmax(areas)) + 1} | \
+                    {j for j in range(1, n) if areas[j - 1] >= 150}
+                mk = np.isin(cc, list(keep)).astype(np.uint8)
+            masks.append(mk)
+        lab[:] = -1                        # 大区域先画, 空格子归属不互抢
+        for i in sorted(range(len(masks)), key=lambda k: -int(masks[k].sum())):
+            lab[(masks[i] > 0) & (lab == -1)] = i
+        region_rows = ["".join("." if v < 0 else digits[v] for v in row)
+                       for row in lab]
+        regions_js = {"regions": regions, "rows": region_rows}
+        print(f"[export_web] 语义区域底图: {len(regions)} 区域")
+
     # 每个关键帧的标注摘要 (FPV 面板显示当前位置语义)
     kf_ann = {}
     for k, v in sem.get("annotations", {}).items():
@@ -157,6 +235,7 @@ def main():
                for (x, y), f, d in zip(kf_px, frame_ids, kf_dir)],
         "kf_ann": kf_ann,
         "nodes": nodes,
+        "semregions": regions_js,        # 语义区域底图层 (null=无)
         "categories": {k: {"zh": v[0],
                            "color": "#%02x%02x%02x" % tuple(int(c * 255) for c in v[1]),
                            "landmark": v[2]}
