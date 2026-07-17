@@ -16,6 +16,7 @@ from .prompts import JUDGE_PROMPT, JUDGE_SCHEMA, NAME_PROMPT, NAME_SCHEMA
 
 VOTE_VOXEL = 0.15          # 足迹投票网格 (米)
 RETURN_CONFIRM_M = 3.0     # 回访几何确认: 相机距目标区域足迹的最大距离
+JUDGE_THIN_M = 0.4         # 空间抽稀: 距上次判定位移小于此值跳过 VLM 判定
 
 
 def _b64_img(p, half=False):
@@ -53,6 +54,8 @@ class VLMRegionEngine:
         self._lock = threading.Lock()
         self._last_snap = 0.0
         self.n_llm = 0
+        self.n_skip = 0            # 空间抽稀跳过的判定数
+        self._last_judge_xy = None
 
     # ---------------- VLM ----------------
     def _chat(self, content, schema, max_tokens=400):
@@ -171,12 +174,22 @@ class VLMRegionEngine:
     def process_frame(self, kf_idx, fid, pose, foot2d=None):
         """顺序调用。pose: c2w(4,4); foot2d: 该帧点云 2D 足迹 (M,2) 或 None。"""
         cam_xy = np.asarray(pose[:2, 3], np.float64)
-        try:
-            out = self._judge(int(fid), cam_xy)
-        except Exception as e:
-            print(f"[vlm-region] kf{kf_idx} 判定失败(帧并入活动区域): {e}",
-                  flush=True)
+        # 空间抽稀: 活动区域内位移不足 JUDGE_THIN_M 的帧空间身份不会变,
+        # 跳过 VLM 判定, 帧与足迹照常并入活动区域 (在线 kf 多为原地旋转/
+        # 微动产生, floor1 实测可跳过 61%)
+        if self.cur is not None and self._last_judge_xy is not None \
+                and float(np.linalg.norm(cam_xy - self._last_judge_xy)) \
+                < JUDGE_THIN_M:
             out = None
+            self.n_skip += 1
+        else:
+            try:
+                self._last_judge_xy = cam_xy
+                out = self._judge(int(fid), cam_xy)
+            except Exception as e:
+                print(f"[vlm-region] kf{kf_idx} 判定失败(帧并入活动区域): "
+                      f"{e}", flush=True)
+                out = None
         prev = self.cur
         if out is None:
             if self.cur is None:
@@ -620,7 +633,8 @@ class VLMRegionEngine:
         png = self.render_layout_png(sd)
         n = sum(1 for r in self.regions.values() if len(r["frames"]) >= 2)
         print(f"[vlm-region] 收尾: {n} 区域 / {len(self.edges)} 边 / "
-              f"LLM 调用 {self.n_llm} 次 -> {sd}")
+              f"LLM 调用 {self.n_llm} 次 (抽稀跳过 {self.n_skip}) "
+              f"-> {sd}")
         return png
 
     def render_layout_png(self, save_dir, scale=None):
